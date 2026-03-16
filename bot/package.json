@@ -1,0 +1,31 @@
+{
+  "name": "delta-neutral-vault-bot",
+  "version": "1.0.0",
+  "description": "Delta-neutral vault bot — Drift Protocol / Solana / BTC + ETH",
+  "main": "dist/index.js",
+  "scripts": {
+    "build":     "tsc",
+    "start":     "node dist/index.js",
+    "dev":       "ts-node src/index.ts",
+    "dev:live":  "DEMO_MODE=false ts-node src/index.ts",
+    "setup":     "node ../scripts/setup-devnet.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor":  "^0.29.0",
+    "@drift-labs/sdk":    "^2.74.0",
+    "@solana/spl-token":  "^0.4.6",
+    "@solana/web3.js":    "^1.91.8",
+    "axios":              "^1.6.8",
+    "bs58":               "^5.0.0",
+    "dotenv":             "^16.4.5",
+    "ws":                 "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/bs58":        "^4.0.4",
+    "@types/node":        "^20.11.30",
+    "@types/ws":          "^8.5.10",
+    "ts-node":            "^10.9.2",
+    "typescript":         "^5.4.3"
+  }
+}
