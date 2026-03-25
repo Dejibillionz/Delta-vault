@@ -117,10 +117,17 @@ export class EnhancedRiskEngine {
     const drawdown = (this.highWaterMark - currentEquity) / this.highWaterMark;
     const totalUnrealizedPnl = positions.reduce((s, p) => s + p.unrealizedPnl, 0);
     const freeCollateralRatio = totalCollateral > 0 ? currentEquity / totalCollateral : 1;
-    const netDelta = Math.abs(
-      positions.reduce((s, p) => s + (p.direction === "LONG" ? p.quoteAmount : -p.quoteAmount), 0)
+    // For delta-neutral positions, spot long + perp short cancel out.
+    // We sum signed exposure: LONG = +notional, SHORT = -notional.
+    // A perfectly hedged position gives 0. We take abs() of the net.
+    const signedDelta = positions.reduce(
+      (s, p) => s + (p.direction === "LONG" ? p.quoteAmount : -p.quoteAmount), 0
     );
-    const deltaExposurePct = currentEquity > 0 ? netDelta / currentEquity : 0;
+    const netDelta = Math.abs(signedDelta);
+    // Cap at total notional to prevent >100% readings
+    const totalNotional = positions.reduce((s, p) => s + p.quoteAmount, 0);
+    const cappedDelta = Math.min(netDelta, totalNotional);
+    const deltaExposurePct = currentEquity > 0 ? cappedDelta / currentEquity : 0;
 
     // ── CHECK 1: Emergency drawdown ──────────────────────────────────────────
     if (drawdown > RISK_LIMITS.MAX_DRAWDOWN) {

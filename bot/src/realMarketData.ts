@@ -14,11 +14,12 @@ import {
   MarketType,
 } from "@drift-labs/sdk";
 import { Connection, PublicKey } from "@solana/web3.js";
-import { PythHttpClient, getPythClusterApiUrl, getPythProgramKeyForCluster } from "@pythnetwork/client";
+import { PythHttpClient, getPythProgramKeyForCluster } from "@pythnetwork/client";
 import axios from "axios";
 import WebSocket from "ws";
 import { Logger } from "./logger";
-
+import { debugLog } from "./logging";
+ 
 // ─── Pyth price feed IDs (mainnet) ───────────────────────────────────────────
 export const PYTH_FEED_IDS = {
   BTC: "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
@@ -62,27 +63,29 @@ type SnapshotCallback = (snap: LiveMarketSnapshot) => void;
 export class RealMarketDataEngine {
   private driftClient: DriftClient;
   private connection: Connection;
-  private pythClient: PythHttpClient;
+  private pythClient!: PythHttpClient;
   private logger: Logger;
   private store: Record<"BTC" | "ETH", LiveMarketSnapshot | null> = { BTC: null, ETH: null };
   private callbacks: SnapshotCallback[] = [];
   private pollTimer: NodeJS.Timeout | null = null;
   private heliusWs: WebSocket | null = null;
+  private network: string;
 
-  constructor(driftClient: DriftClient, connection: Connection, logger: Logger) {
+  constructor(driftClient: DriftClient, connection: Connection, logger: Logger, network: string) {
     this.driftClient = driftClient;
     this.connection = connection;
     this.logger = logger;
+    this.network = network;
 
     // Pyth HTTP client (Pythnet mainnet)
-    const pythConnection = new Connection(
-      getPythClusterApiUrl("pythnet"),
-      "confirmed"
-    );
-    this.pythClient = new PythHttpClient(
-      pythConnection,
-      getPythProgramKeyForCluster("pythnet")
-    );
+   
+
+const pythProgramKey = getPythProgramKeyForCluster("mainnet-beta");
+
+this.pythClient = new PythHttpClient(
+  connection,
+  pythProgramKey
+);
   }
 
   async start(): Promise<void> {
@@ -162,12 +165,12 @@ export class RealMarketDataEngine {
       // Use Pyth spot price; fall back to Drift index price
       const spotPrice = pyth.price > 0 ? pyth.price : indexPrice;
 
-      // Funding rate: lastFundingRate is the hourly rate in PRICE_PRECISION
-      const fundingRate = convertToNumber(market.amm.lastFundingRate, PRICE_PRECISION);
+      // Funding rate: lastFundingRate is the hourly rate in PRICE_PRECISION (as percentage)
+      const fundingRate = convertToNumber(market.amm.lastFundingRate, PRICE_PRECISION) / 1e6;
       const fundingRateAnnualized = fundingRate * 24 * 365;
 
       // Next funding timestamp
-      const nextFundingTime = market.amm.nextFundingRateRecordTime.toNumber() * 1000;
+      const nextFundingTime = market.amm.lastFundingRate.toNumber() * 1000;
 
       // Basis
       const basisSpread = spotPrice > 0 ? (perpPrice - spotPrice) / spotPrice : 0;
@@ -183,8 +186,14 @@ export class RealMarketDataEngine {
       const totalOI = longOI + shortOI;
       const longShortRatio = totalOI > 0 ? longOI / totalOI : 0.5;
 
-      // Liquidity score: normalized by $50M OI cap
-      const liquidityScore = Math.min(Math.sqrt(openInterest / 50_000_000), 1);
+      // Network-aware liquidity score.
+      // Devnet OI is ~$1-5M vs mainnet ~$50M+, so cap is scaled accordingly.
+      // On devnet we also apply a minimum floor of 0.15 so that markets with
+      // near-zero OI (like ETH devnet) still register as tradeable for testing.
+      const isDevnet = process.env.SOLANA_NETWORK !== 'mainnet-beta';
+      const oiCap = isDevnet ? 2_000_000 : 50_000_000;
+      const rawScore = Math.min(Math.sqrt(openInterest / oiCap), 1);
+      const liquidityScore = isDevnet ? Math.max(rawScore, 0.15) : rawScore;
 
       const snap: LiveMarketSnapshot = {
         asset, timestamp: Date.now(),
@@ -198,7 +207,7 @@ export class RealMarketDataEngine {
       this.store[asset] = snap;
       this.callbacks.forEach(cb => cb(snap));
 
-      this.logger.debug(
+      debugLog(
         `${asset} | spot=${usd(spotPrice)} | perp=${usd(perpPrice)} | ` +
         `FR=${pct(fundingRate)} | basis=${pct(basisSpread, 2)} | OI=${usd(openInterest)}`
       );

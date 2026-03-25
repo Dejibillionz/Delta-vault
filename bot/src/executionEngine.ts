@@ -79,16 +79,16 @@ export class ExecutionEngine {
 
     const raw = JSON.parse(fs.readFileSync(keypairPath, "utf-8"));
     const keypair = Keypair.fromSecretKey(Uint8Array.from(raw));
-    this.wallet = new Wallet(keypair);
+    this.wallet = new Wallet(keypair as any);
 
     this.logger.info(`Wallet loaded: ${keypair.publicKey.toBase58()}`);
   }
 
   async initialize(): Promise<void> {
-    const accountLoader = new BulkAccountLoader(this.connection, "confirmed", 1000);
+    const accountLoader = new BulkAccountLoader(this.connection as any, "confirmed", 1000);
 
     this.client = new DriftClient({
-      connection: this.connection,
+      connection: this.connection as any,
       wallet: this.wallet,
       programID: new PublicKey(process.env.DRIFT_PROGRAM_ID ?? "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH"),
       accountSubscription: {
@@ -219,7 +219,7 @@ export class ExecutionEngine {
     const baseAmount = convertToNumber(position.baseAssetAmount, BASE_PRECISION);
     const entryPrice = convertToNumber(position.quoteAssetAmount, QUOTE_PRECISION) / Math.abs(baseAmount);
     const unrealizedPnl = convertToNumber(
-      user.getUnrealizedPNL(true, marketIndex, MarketType.PERP),
+      user.getUnrealizedPNL(true, marketIndex),
       QUOTE_PRECISION
     );
 
@@ -250,8 +250,8 @@ export class ExecutionEngine {
     const market = this.client.getPerpMarketAccount(marketIndex);
     if (!market) throw new Error(`No market data for ${asset}`);
 
-    // lastFundingRate is per-slot — convert to hourly rate
-    const rawRate = convertToNumber(market.amm.lastFundingRate, PRICE_PRECISION);
+    // lastFundingRate is per-slot — convert to hourly rate (as percentage)
+    const rawRate = convertToNumber(market.amm.lastFundingRate, PRICE_PRECISION) / 1e6;
     return rawRate;
   }
 

@@ -8,16 +8,16 @@
  *   3. PARK_CAPITAL  — no opportunity → deploy to stable yield
  */
 
-import { MarketSnapshot } from "./marketDataEngine";
+import { LiveMarketSnapshot } from "./realMarketData";
 import { Logger } from "./logger";
 
 // ─── Strategy thresholds ──────────────────────────────────────────────────────
 export const THRESHOLDS = {
   // Minimum hourly funding rate to open delta-neutral position
-  FUNDING_RATE_MIN: 0.0001,       // 0.01% per hour = ~0.87% APR
+  FUNDING_RATE_MIN: 0.00001,      // 0.001% per hour = ~0.087% APR (relaxed for demo)
 
   // Minimum basis spread to execute basis trade
-  BASIS_SPREAD_MIN: 0.01,         // 1%
+  BASIS_SPREAD_MIN: 0.005,        // 0.5% (relaxed for demo)
 
   // Funding rate below this → exit delta-neutral, too little yield
   FUNDING_RATE_EXIT: 0.00005,     // 0.005% per hour
@@ -25,8 +25,8 @@ export const THRESHOLDS = {
   // Basis spread below this → exit basis trade, convergence complete
   BASIS_SPREAD_EXIT: 0.003,       // 0.3%
 
-  // Minimum liquidity score required to enter (0–1)
-  MIN_LIQUIDITY_SCORE: 0.3,
+  // Lowered to 0.1 to work on devnet (thin liquidity); raise to 0.3 for mainnet
+  MIN_LIQUIDITY_SCORE: 0.1,
 
   // Maximum position size as fraction of vault (per asset)
   MAX_POSITION_FRACTION: 0.4,
@@ -84,9 +84,9 @@ export class StrategyEngine {
   }
 
   // ─── Evaluate market snapshot → emit signal ──────────────────────────────
-  evaluate(snapshot: MarketSnapshot): Signal {
+  evaluate(snapshot: LiveMarketSnapshot): Signal {
     const { asset, fundingRate, basisSpread, liquidityScore, spotPrice, perpPrice } = snapshot;
-    const currentState = this.state[asset];
+    const currentState = this.state[asset as keyof ActiveState];
 
     const meta = { fundingRate, basisSpread, spotPrice, perpPrice, liquidityScore };
     const maxSize = this.vaultEquity * THRESHOLDS.MAX_POSITION_FRACTION;

@@ -23,6 +23,9 @@ import * as fs from "fs";
 import * as bs58 from "bs58";
 import { Logger } from "./logger";
 
+// Declare window for browser compatibility (Phantom adapter)
+declare const window: any;
+
 // ─── Wallet info snapshot ────────────────────────────────────────────────────
 export interface WalletInfo {
   address: string;
@@ -36,7 +39,7 @@ export interface WalletInfo {
 // SERVER WALLET — used by the live bot
 // Loads a keypair from disk or env var (base58-encoded private key)
 // ─────────────────────────────────────────────────────────────────────────────
-export class ServerWallet implements Wallet {
+export class ServerWallet {
   readonly publicKey: PublicKey;
   private keypair: Keypair;
   private logger: Logger;
@@ -66,17 +69,28 @@ export class ServerWallet implements Wallet {
     this.logger.info(`Vault wallet address: ${this.publicKey.toBase58()}`);
   }
 
-  async signTransaction<T extends Transaction | VersionedTransaction>(tx: T): Promise<T> {
-    if (tx instanceof VersionedTransaction) {
-      tx.sign([this.keypair]);
-    } else {
-      tx.sign(this.keypair);
-    }
+  async signTransaction(tx: Transaction): Promise<Transaction> {
+    tx.sign(this.keypair);
     return tx;
   }
 
-  async signAllTransactions<T extends Transaction | VersionedTransaction>(txs: T[]): Promise<T[]> {
-    return Promise.all(txs.map(tx => this.signTransaction(tx)));
+  async signAllTransactions(txs: Transaction[]): Promise<Transaction[]> {
+    return txs.map(tx => {
+      tx.sign(this.keypair);
+      return tx;
+    });
+  }
+
+  async signVersionedTransaction(tx: VersionedTransaction): Promise<VersionedTransaction> {
+    tx.sign([this.keypair]);
+    return tx;
+  }
+
+  async signAllVersionedTransactions(txs: VersionedTransaction[]): Promise<VersionedTransaction[]> {
+    return txs.map(tx => {
+      tx.sign([this.keypair]);
+      return tx;
+    });
   }
 
   getAddress(): string {

@@ -22,6 +22,7 @@ import { ServerWallet } from "./walletIntegration";
 import { PortfolioMetrics } from "./enhancedRiskEngine";
 import { LiveMarketSnapshot } from "./realMarketData";
 import { Logger } from "./logger";
+import { debugLog } from "./logging";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const VAULT_PROGRAM_ID = new PublicKey(
@@ -118,7 +119,7 @@ export class OnChainSync {
       const paused = (metrics.worstAction === "PAUSE_EXECUTION" ||
                       metrics.worstAction === "EMERGENCY_CLOSE") ? 1 : 0;
 
-      this.logger.debug(
+      debugLog(
         `OnChainSync: pushing risk — drawdown=${drawdownBps}bps ` +
         `delta=${deltaBps}bps paused=${paused}`
       );
@@ -179,7 +180,7 @@ export class OnChainSync {
     //     .accounts({ vaultState: this.vaultPda, bot: this.wallet.publicKey, ... })
     //     .rpc();
     //   return txSig;
-    this.logger.debug(`[STUB] sendVaultInstruction: ${_instructionName}`);
+    debugLog(`[STUB] sendVaultInstruction: ${_instructionName}`);
     return "stub_tx_sig";
   }
 }
