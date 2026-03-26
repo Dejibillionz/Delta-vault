@@ -4,28 +4,36 @@
  */
 
 import { DriftClient } from "@drift-labs/sdk";
-import { Connection } from "@solana/web3.js";
 import { Logger } from "../logger";
+import { CROSS_CHAIN_CONFIG } from "../config/crossChain";
 
-// Mock GMX funding rates (replace with real GMX SDK/API)
-async function getGmxFunding(): Promise<{ BTC: number; ETH: number }> {
-  // GMX funding rates are typically in basis points per hour
-  // Mocking higher rates on Arbitrum for demo
-  return {
-    BTC: 0.00015, // 0.015% per hour
-    ETH: 0.00012, // 0.012% per hour
+type FundingByAsset = { BTC: number; ETH: number };
+type FundingByChain = Record<string, FundingByAsset>;
+
+// Mock chain feeds (replace with real venue SDK/APIs later)
+async function getMockFunding(chain: string): Promise<FundingByAsset> {
+  const MOCK: Record<string, FundingByAsset> = {
+    arbitrum: { BTC: 0.00015, ETH: 0.00012 },
+    base: { BTC: 0.00022, ETH: 0.00019 },
+    optimism: { BTC: 0.00018, ETH: 0.00016 },
+    polygon: { BTC: 0.00011, ETH: 0.00014 },
+    avalanche: { BTC: 0.00013, ETH: 0.00010 },
+    bnb: { BTC: 0.00020, ETH: 0.00017 },
   };
+  return MOCK[chain] ?? { BTC: 0, ETH: 0 };
 }
 
 // Drift funding rates (existing)
-async function getDriftFunding(driftClient: DriftClient): Promise<{ BTC: number; ETH: number }> {
+async function getDriftFunding(driftClient: DriftClient): Promise<FundingByAsset> {
   const marketIndex = { BTC: 1, ETH: 2 };
   const rates: { BTC: number; ETH: number } = { BTC: 0, ETH: 0 };
 
   for (const [asset, idx] of Object.entries(marketIndex)) {
     const market = driftClient.getPerpMarketAccount(idx);
     if (market) {
-      const rate = market.amm.lastFundingRate.toNumber() / 1e6; // convert from PRICE_PRECISION
+      // lastFundingRate is raw integer; convert to decimal funding rate.
+      // Equivalent to: convertToNumber(raw, 1e6) / 1e6
+      const rate = market.amm.lastFundingRate.toNumber() / 1e12;
       rates[asset as "BTC" | "ETH"] = rate;
     }
   }
@@ -34,46 +42,60 @@ async function getDriftFunding(driftClient: DriftClient): Promise<{ BTC: number;
 }
 
 function normalizeDriftFunding(raw: number): number {
-  return raw / 1e6; // try this first
+  // Drift rate is already scaled in getDriftFunding(), so do not rescale again.
+  return raw;
 }
 
 function sanitizeFunding(rate: number): number {
   // clamp extreme values
-  return Math.max(Math.min(rate, 0.01), -0.01);
+  return Math.max(Math.min(rate, 0.005), -0.005);
 }
 
 function normalizeFunding(raw: number): number {
   return sanitizeFunding(normalizeDriftFunding(raw));
 }
 
-export async function getCrossChainFunding(driftClient: DriftClient, logger: Logger): Promise<{
-  solana: { BTC: number; ETH: number };
-  arbitrum: { BTC: number; ETH: number };
-}> {
+export async function getCrossChainFunding(driftClient: DriftClient, logger: Logger): Promise<FundingByChain> {
   try {
-    const [solanaRaw, arbitrumRaw] = await Promise.all([
-      getDriftFunding(driftClient),
-      getGmxFunding(),
-    ]);
+    const solanaRaw = await getDriftFunding(driftClient);
+    const nonSolanaChains = CROSS_CHAIN_CONFIG.CHAINS.filter(chain => chain !== "solana");
+
+    const mockedRates = await Promise.all(nonSolanaChains.map(chain => getMockFunding(chain)));
+    const nonSolanaMap: FundingByChain = {};
+    nonSolanaChains.forEach((chain, i) => {
+      nonSolanaMap[chain] = mockedRates[i];
+    });
 
     // Log raw values for debugging
     logger.info(`RAW Drift funding: ${JSON.stringify(solanaRaw)}`);
-    logger.info(`RAW GMX funding: ${JSON.stringify(arbitrumRaw)}`);
+    logger.info(`RAW Non-Solana funding: ${JSON.stringify(nonSolanaMap)}`);
 
     // Normalize funding rates
     const solana = {
       BTC: normalizeFunding(solanaRaw.BTC),
       ETH: normalizeFunding(solanaRaw.ETH),
     };
-    const arbitrum = {
-      BTC: normalizeFunding(arbitrumRaw.BTC),
-      ETH: normalizeFunding(arbitrumRaw.ETH),
+    const normalizedOthers: FundingByChain = {};
+    for (const [chain, rates] of Object.entries(nonSolanaMap)) {
+      normalizedOthers[chain] = {
+        BTC: normalizeFunding(rates.BTC),
+        ETH: normalizeFunding(rates.ETH),
+      };
+    }
+
+    const fundingByChain: FundingByChain = {
+      solana,
+      ...normalizedOthers,
     };
 
-    logger.info(`Cross-chain funding: Solana=${JSON.stringify(solana)}, Arbitrum=${JSON.stringify(arbitrum)}`);
-    return { solana, arbitrum };
+    logger.info(`Cross-chain funding map: ${JSON.stringify(fundingByChain)}`);
+    return fundingByChain;
   } catch (err: any) {
     logger.error(`getCrossChainFunding: ${err.message}`);
-    return { solana: { BTC: 0, ETH: 0 }, arbitrum: { BTC: 0, ETH: 0 } };
+    const fallback: FundingByChain = {};
+    for (const chain of CROSS_CHAIN_CONFIG.CHAINS) {
+      fallback[chain] = { BTC: 0, ETH: 0 };
+    }
+    return fallback;
   }
 }

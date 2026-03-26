@@ -56,6 +56,7 @@ export interface OrderRecord {
 
 export interface DeltaNeutralPosition {
   asset: Asset;
+  side: "short-perp" | "long-perp";
   openedAt: number;
   spotNotional: number;       // USD value of spot long
   perpNotional: number;       // USD value of perp short
@@ -100,11 +101,28 @@ export class LiveExecutionEngine {
   // Executes both legs atomically (best-effort):
   //   Leg 1: Buy spot via Jupiter  (USDC → BTC/ETH)
   //   Leg 2: Short perp via Drift
-  async openDeltaNeutral(asset: Asset, usdNotional: number, fundingRate: number): Promise<DeltaNeutralPosition | null> {
-    this.logger.trade(`Opening DELTA-NEUTRAL ${asset} | notional=$${usdNotional.toFixed(0)} | FR=${pct(fundingRate)}`);
+  async openDeltaNeutral({
+    side,
+    asset,
+    amount,
+    fundingRate,
+  }: {
+    side: "short-perp" | "long-perp";
+    asset: Asset;
+    amount: number;
+    fundingRate: number;
+  }): Promise<DeltaNeutralPosition | null> {
+    this.logger.trade(`Opening DELTA-NEUTRAL ${asset} | side=${side} | notional=$${amount.toFixed(0)} | FR=${pct(fundingRate)}`);
+    if (side === "short-perp") {
+      this.logger.trade(`${asset}: LONG spot + SHORT perp`);
+    }
+    if (side === "long-perp") {
+      this.logger.trade(`${asset}: SHORT spot + LONG perp`);
+    }
 
     const position: DeltaNeutralPosition = {
       asset,
+      side,
       openedAt: Date.now(),
       spotNotional: 0,
       perpNotional: 0,
@@ -114,27 +132,35 @@ export class LiveExecutionEngine {
       legs: [],
     };
 
-    // ── LEG 1: Spot long via Jupiter ────────────────────────────────────
-    const spotResult = await this.jupiterSwap("USDC", asset, usdNotional);
+    // ── LEG 1: Spot leg via Jupiter ─────────────────────────────────────
+    const spotResult = side === "short-perp"
+      ? await this.jupiterSwap("USDC", asset, amount)
+      : await this.jupiterSwap(asset, "USDC", amount);
     position.legs.push(spotResult);
 
     if (spotResult.status === "FAILED") {
       this.logger.error(`${asset}: Spot leg failed — aborting. No perp order sent.`);
       return null;
     }
-    position.spotNotional = usdNotional;
+    position.spotNotional = amount;
     this.logger.trade(`${asset}: Spot leg FILLED — tx: ${spotResult.txSig}`);
 
-    // ── LEG 2: Perp short via Drift ─────────────────────────────────────
-    const perpResult = await this.driftPerpShort(asset, usdNotional);
+    // ── LEG 2: Perp leg via Drift ───────────────────────────────────────
+    const perpResult = side === "short-perp"
+      ? await this.driftPerpShort(asset, amount)
+      : await this.driftPerpLong(asset, amount);
     position.legs.push(perpResult);
 
     if (perpResult.status === "FAILED") {
       this.logger.error(`${asset}: Perp leg failed — unwinding spot leg`);
-      await this.jupiterSwap(asset, "USDC", usdNotional);
+      if (side === "short-perp") {
+        await this.jupiterSwap(asset, "USDC", amount);
+      } else {
+        await this.jupiterSwap("USDC", asset, amount);
+      }
       return null;
     }
-    position.perpNotional = usdNotional;
+    position.perpNotional = amount;
     this.logger.trade(`${asset}: Perp leg FILLED — tx: ${perpResult.txSig}`);
 
     this.openPositions.set(asset, position);
@@ -153,8 +179,10 @@ export class LiveExecutionEngine {
     const perpClose = await this.driftClosePerp(asset);
     pos.legs.push(perpClose);
 
-    // Sell spot back to USDC
-    const spotClose = await this.jupiterSwap(asset, "USDC", pos.spotNotional);
+    // Close spot leg based on opening side
+    const spotClose = pos.side === "short-perp"
+      ? await this.jupiterSwap(asset, "USDC", pos.spotNotional)
+      : await this.jupiterSwap("USDC", asset, pos.spotNotional);
     pos.legs.push(spotClose);
 
     this.openPositions.delete(asset);
@@ -210,6 +238,50 @@ export class LiveExecutionEngine {
       record.status = "FAILED";
       record.error = err.message;
       this.logger.error(`Drift SHORT failed (${asset}): ${err.message}`);
+    }
+
+    this.orderLog.push(record);
+    return record;
+  }
+
+  // ─── DRIFT: Place perp long order ───────────────────────────────────────
+  private async driftPerpLong(asset: Asset, usdNotional: number): Promise<OrderRecord> {
+    const record = this.newRecord(asset, "PERP", "BUY", usdNotional);
+
+    try {
+      const mi = PERP_MARKET[asset].index;
+      const market = this.driftClient.getPerpMarketAccount(mi);
+      if (!market) throw new Error(`No market data for ${asset}`);
+
+      const markPrice = convertToNumber(market.amm.lastMarkPriceTwap, PRICE_PRECISION);
+      const baseAmount = usdNotional / markPrice;
+      const minSize = PERP_MARKET[asset].minOrderSize;
+
+      if (baseAmount < minSize) {
+        throw new Error(`Order too small: ${baseAmount.toFixed(6)} < min ${minSize}`);
+      }
+
+      const baseAmountBN = new BN(Math.floor(baseAmount * BASE_PRECISION.toNumber()));
+
+      const orderParams = getMarketOrderParams({
+        marketIndex: mi,
+        direction: PositionDirection.LONG,
+        baseAssetAmount: baseAmountBN,
+        marketType: MarketType.PERP,
+        reduceOnly: false,
+      });
+
+      const txSig = await this.driftClient.placePerpOrder(orderParams);
+      await this.connection.confirmTransaction(txSig, "confirmed");
+
+      record.txSig = txSig;
+      record.status = "FILLED";
+      record.fillPrice = markPrice;
+      this.logger.trade(`Drift LONG ${asset} | size=${baseAmount.toFixed(6)} | price=${usd(markPrice)} | tx=${txSig}`);
+    } catch (err: any) {
+      record.status = "FAILED";
+      record.error = err.message;
+      this.logger.error(`Drift LONG failed (${asset}): ${err.message}`);
     }
 
     this.orderLog.push(record);

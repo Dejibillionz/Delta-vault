@@ -120,20 +120,23 @@ export class StrategyEngine {
     // ── ENTRY CONDITIONS ─────────────────────────────────────────────────────
 
     if (currentState === "NONE" || currentState === "PARKED") {
-      // 1. Delta-neutral: collect funding
+      // 1. Delta-neutral: collect funding (both positive and negative funding)
       if (
-        fundingRate > THRESHOLDS.FUNDING_RATE_MIN &&
+        Math.abs(fundingRate) > THRESHOLDS.FUNDING_RATE_MIN &&
         liquidityScore >= THRESHOLDS.MIN_LIQUIDITY_SCORE
       ) {
         const size = this.sizeDeltaNeutral(fundingRate, maxSize);
+        const fundingDirection = fundingRate >= 0 ? "positive" : "negative";
         this.logger.trade(
-          `${asset} SIGNAL: DELTA_NEUTRAL_OPEN — FR=${pct(fundingRate)}, size=$${size.toFixed(0)}`
+          `${asset} SIGNAL: DELTA_NEUTRAL_OPEN — ${fundingDirection} FR=${pct(fundingRate)}, size=$${size.toFixed(0)}`
         );
         return {
           asset,
           signal: "DELTA_NEUTRAL_OPEN",
-          reason: `Funding rate ${pct(fundingRate)} > threshold ${pct(THRESHOLDS.FUNDING_RATE_MIN)}`,
-          urgency: fundingRate > THRESHOLDS.FUNDING_RATE_MIN * 3 ? "HIGH" : "MEDIUM",
+          reason: fundingRate >= 0
+            ? `Positive funding ${pct(fundingRate)} > threshold ${pct(THRESHOLDS.FUNDING_RATE_MIN)} (LONG spot + SHORT perp)`
+            : `Negative funding ${pct(fundingRate)} < -threshold ${pct(THRESHOLDS.FUNDING_RATE_MIN)} (SHORT spot + LONG perp)`,
+          urgency: Math.abs(fundingRate) > THRESHOLDS.FUNDING_RATE_MIN * 3 ? "HIGH" : "MEDIUM",
           suggestedSizeUSD: size,
           metadata: meta,
         };
@@ -183,7 +186,7 @@ export class StrategyEngine {
   // ─── Position sizing ──────────────────────────────────────────────────────
   // Scale size proportionally to funding rate strength (Kelly-like)
   private sizeDeltaNeutral(fundingRate: number, maxSize: number): number {
-    const ratio = Math.min(fundingRate / (THRESHOLDS.FUNDING_RATE_MIN * 5), 1);
+    const ratio = Math.min(Math.abs(fundingRate) / (THRESHOLDS.FUNDING_RATE_MIN * 5), 1);
     return Math.max(1000, maxSize * (0.25 + 0.75 * ratio));
   }
 

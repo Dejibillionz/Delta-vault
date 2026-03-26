@@ -7,6 +7,9 @@ export const CROSS_CHAIN_CONFIG = {
   // Enable/disable cross-chain module
   ENABLED: true,
 
+  // Chains to scan for funding opportunities
+  CHAINS: ["solana", "arbitrum", "base", "optimism", "polygon", "avalanche", "bnb"] as const,
+
   // Minimum net edge after costs to execute (1.5%)
   MIN_NET_EDGE: 0.015,
 
@@ -21,6 +24,10 @@ export const CROSS_CHAIN_CONFIG = {
 
   // Maximum expected bridge time in seconds (10 minutes)
   MAX_BRIDGE_TIME: 600,
+
+  // Profit projection window for funding carry (hours)
+  // We compare one-time move costs vs projected funding edge over this horizon.
+  PROFIT_HORIZON_HOURS: 24,
 
   // Keep true for hackathon safety
   SIMULATION_MODE: true,

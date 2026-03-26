@@ -9,6 +9,7 @@
 
 import * as dotenv from "dotenv";
 import * as path from "path";
+import * as http from "http";
 
 // Load .env from bot/ folder or current directory
 dotenv.config({ path: path.join(__dirname, "../../bot/.env") });
@@ -51,6 +52,8 @@ const NETWORK       = process.env.SOLANA_NETWORK ?? "devnet";
 const CYCLE_MS      = 30_000;
 const RISK_CYCLE_MS = 10_000;
 const VAULT_EQUITY  = 250_000;
+const MIN_TRADE_SIZE = 1_000;
+const CARRYOVER_DECAY = 0.75; // Retain 75% of carryover per cycle when signal is absent
 
 const logger = new Logger("./logs");
 
@@ -123,6 +126,7 @@ async function main() {
     stopping = true;
     logger.warn("SIGINT — shutting down");
     clearInterval(riskLoop);
+    apiServer.close();
     await marketEngine.stop();
     await driftClient.unsubscribe();
     logger.close();
@@ -135,10 +139,70 @@ async function main() {
   let currentStrategies: Record<string, string> = { BTC: "PARKED", ETH: "PARKED" };
   let previousSnapshots: Record<string, LiveMarketSnapshot> = {};
   let latestDrawdown = 0;
+  let tradeCarryOver: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
 
-  // Cross-chain state
-  let currentChain = "solana";
-  let lastCrossChainTime = 0;
+  // Cross-chain state (independent by asset)
+  const currentChains: Record<"BTC" | "ETH", string> = { BTC: "solana", ETH: "solana" };
+  const lastCrossChainTimes: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
+  let latestCrossChainDecisions: Record<"BTC" | "ETH", any> = {
+    BTC: { execute: false, reason: "Waiting" },
+    ETH: { execute: false, reason: "Waiting" },
+  };
+  let latestFundingByChain: Record<string, { BTC: number; ETH: number }> = {};
+
+  const botState: any = {
+    timestamp: Date.now(),
+    tick: 0,
+    mode: DEMO_MODE ? "SIMULATION" : "LIVE",
+    network: NETWORK,
+    prices: { BTC: 0, ETH: 0 },
+    funding: { BTC: 0, ETH: 0 },
+    basis: { BTC: 0, ETH: 0 },
+    signals: { BTC: "PARKED", ETH: "PARKED" },
+    positionsCount: 0,
+    nav: VAULT_EQUITY,
+    pnl: 0,
+    drawdown: 0,
+    deltaExposure: 0,
+    lending: { deployed: 0, yield: 0 },
+    lendingByAsset: { BTC: { amount: 0, yield: 0 }, ETH: { amount: 0, yield: 0 } },
+    positions: [] as any[],
+    executionEvents: [] as string[],
+    execution: { executedTrade: false, events: [] as string[] },
+    capital: {
+      starting: VAULT_EQUITY,
+      reservedForTrades: 0,
+      releasedFromTrades: 0,
+      lent: 0,
+      remainingBeforeLending: 0,
+      remainingAfterLending: 0,
+      carryOver: { BTC: 0, ETH: 0, total: 0 },
+    },
+    crossChain: {
+      currentChains,
+      decisions: latestCrossChainDecisions,
+      fundingByChain: latestFundingByChain,
+    },
+  };
+
+  const apiServer = http.createServer((_, res) => {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+    });
+    res.end(JSON.stringify(botState));
+  });
+  apiServer.on("error", (err: any) => {
+    if (err?.code === "EADDRINUSE") {
+      logger.warn("State API port 3001 already in use; dashboard sync may point to another bot instance");
+      return;
+    }
+    logger.error(`State API error: ${err?.message ?? err}`);
+  });
+  apiServer.listen(3001, () => {
+    logger.info("State API running at http://localhost:3001");
+  });
 
   // Utility
   function pct(n: number, d = 4): string {
@@ -165,6 +229,25 @@ async function main() {
 
   function applyRiskAdjustment(score: number, riskLevel: number): number {
     return score * (1 - riskLevel);
+  }
+
+  function allocateForTrade(amount: number, state: { availableCapital: number }): number {
+    const requested = Math.max(0, amount);
+    if (requested > state.availableCapital) {
+      throw new Error("Not enough capital");
+    }
+    state.availableCapital -= requested;
+    return requested;
+  }
+
+  function releaseTradeCapital(amount: number, state: { availableCapital: number }, totalCapital: number): void {
+    state.availableCapital = Math.min(totalCapital, state.availableCapital + Math.max(0, amount));
+  }
+
+  function allocateForLending(state: { availableCapital: number }): number {
+    const amount = state.availableCapital;
+    state.availableCapital = 0;
+    return amount;
   }
 
   async function deployToLending(asset: string, amount: number): Promise<number> {
@@ -250,30 +333,41 @@ async function main() {
       if (CROSS_CHAIN_CONFIG.ENABLED) {
         try {
           const funding = await getCrossChainFunding(driftClient, logger);
-          const decision = evaluateCrossChain({
-            currentChain,
-            fundingRates: funding,
-            capital: VAULT_EQUITY,
-            lastExecutionTime: lastCrossChainTime,
-            logger,
-          });
-
-          logger.info(`🌉 Cross-chain decision: ${JSON.stringify(decision)}`);
-
-          if (decision.execute) {
-            const result = await executeCrossChain({
-              fromChain: currentChain,
-              toChain: decision.bestChain!,
-              amount: decision.allocation!,
+          latestFundingByChain = funding;
+          for (const asset of ["BTC", "ETH"] as const) {
+            const decision = evaluateCrossChain({
+              asset,
+              currentChain: currentChains[asset],
+              fundingRates: funding,
+              capital: VAULT_EQUITY / 2,
+              lastExecutionTime: lastCrossChainTimes[asset],
               logger,
             });
 
-            if (result.success) {
-              currentChain = decision.bestChain!;
-              lastCrossChainTime = Date.now();
-              logger.info(`✅ Cross-chain move completed: ${currentChain}`);
-            } else {
-              logger.error(`❌ Cross-chain move failed`);
+            logger.info(
+              `🌉 Cross-chain decision (${asset}): ${decision.reason} | ` +
+              `from=${decision.currentChain} to=${decision.bestChain ?? decision.currentChain} | ` +
+              `edge=${((decision.netEdge ?? 0) * 100).toFixed(4)}% | ` +
+              `estProfit=$${(decision.expectedProfitUsd ?? 0).toFixed(2)}`
+            );
+            latestCrossChainDecisions[asset] = decision;
+
+            if (decision.execute) {
+              const result = await executeCrossChain({
+                asset,
+                fromChain: currentChains[asset],
+                toChain: decision.bestChain!,
+                amount: decision.allocation!,
+                logger,
+              });
+
+              if (result.success) {
+                currentChains[asset] = decision.bestChain!;
+                lastCrossChainTimes[asset] = Date.now();
+                logger.info(`✅ Cross-chain move completed (${asset}): ${currentChains[asset]}`);
+              } else {
+                logger.error(`❌ Cross-chain move failed (${asset})`);
+              }
             }
           }
         } catch (err: any) {
@@ -284,11 +378,23 @@ async function main() {
       // ── Data Collection for Logging ──────────────────────────────────────────
       let marketData: any = {};
       let strategyData: any = { deltaCapital: 0, lendingCapital: 0 };
-      let executionData: any = { executedTrade: false };
+      let executionData: any = { executedTrade: false, events: [] as string[] };
       let riskData: any = {};
-      let lendingData: any = { deployed: 0, yieldEarned: 0 };
+      let lendingData: any = { deployed: 0, yieldEarned: 0, byAsset: { BTC: { amount: 0, yield: 0 }, ETH: { amount: 0, yield: 0 } } };
       let pnl = simulatedPnl;
       let mode = "BALANCED";
+      const totalCapital = VAULT_EQUITY;
+      const capitalState = { availableCapital: totalCapital };
+      const capitalData = {
+        starting: totalCapital,
+        reservedForTrades: 0,
+        releasedFromTrades: 0,
+        lent: 0,
+        remainingBeforeLending: 0,
+        remainingAfterLending: 0,
+        carryOver: { BTC: 0, ETH: 0, total: 0 },
+      };
+      const plannedLendingByAsset: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
 
       // Per-asset strategy
       for (const asset of ["BTC", "ETH"] as const) {
@@ -348,55 +454,110 @@ async function main() {
           finalAllocation = { delta: 0, lending: 1 };
         }
 
-        const capitalPerAsset = VAULT_EQUITY / 2; // split between BTC and ETH
-        const deltaCapitalAsset = capitalPerAsset * finalAllocation.delta;
-        const lendingCapitalAsset = capitalPerAsset * finalAllocation.lending;
-
-        // Accumulate for logging
-        strategyData.deltaCapital += deltaCapitalAsset;
-        strategyData.lendingCapital += lendingCapitalAsset;
+        const capitalPerAsset = totalCapital / 2; // split between BTC and ETH
+        const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset * finalAllocation.delta));
+        plannedLendingByAsset[asset] = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset * finalAllocation.lending));
 
         // Strategy state tracking
         if (finalAllocation.delta > 0.7) mode = "AGGRESSIVE";
         else if (finalAllocation.delta < 0.3) mode = "DEFENSIVE";
 
-        // Execute both strategies
-        if (deltaCapitalAsset > 1000) { // minimum trade size
-          // Handle trade
-          if (signal.signal === "DELTA_NEUTRAL_OPEN") {
+        // Capital manager: reserve for trade first, then lend leftover later
+        const isOpenSignal = signal.signal === "DELTA_NEUTRAL_OPEN" || signal.signal === "BASIS_TRADE_OPEN";
+        let executionSizeUSD = 0;
+        if (isOpenSignal) {
+          const requestedExecutionUSD = Math.min(
+            capitalPerAsset,
+            Math.max(0, deltaCapitalAsset + (tradeCarryOver[asset] ?? 0))
+          );
+
+          const reservableAmount = Math.min(requestedExecutionUSD, capitalState.availableCapital);
+          if (reservableAmount > 0) {
+            executionSizeUSD = allocateForTrade(reservableAmount, capitalState);
+            capitalData.reservedForTrades += executionSizeUSD;
+          }
+
+          if (executionSizeUSD < MIN_TRADE_SIZE && executionSizeUSD > 0) {
+            releaseTradeCapital(executionSizeUSD, capitalState, totalCapital);
+            capitalData.releasedFromTrades += executionSizeUSD;
+            tradeCarryOver[asset] = requestedExecutionUSD;
+            executionData.events.push(
+              `${asset}: accumulated $${tradeCarryOver[asset].toFixed(0)} (below minimum ${MIN_TRADE_SIZE})`
+            );
+            executionSizeUSD = 0;
+          }
+
+          if (executionSizeUSD <= 0 && requestedExecutionUSD > 0) {
+            tradeCarryOver[asset] = requestedExecutionUSD;
+            executionData.events.push(`${asset}: waiting to accumulate ($${tradeCarryOver[asset].toFixed(0)})`);
+          }
+
+          if (executionSizeUSD >= MIN_TRADE_SIZE) {
             if (DEMO_MODE) {
-              logger.trade(`[DEMO] ${asset} DELTA_NEUTRAL: spot long + perp short $${deltaCapitalAsset.toFixed(0)}`);
-              strategyEngine.setState(asset, "DELTA_NEUTRAL");
-              currentStrategies[asset] = "DELTA_NEUTRAL";
-              // Store both legs
+              const tradeType = signal.signal === "DELTA_NEUTRAL_OPEN" ? "DELTA_NEUTRAL" : "BASIS_TRADE";
+              const isNegativeFunding = signal.signal === "DELTA_NEUTRAL_OPEN" && signal.metadata.fundingRate < 0;
+              const side = isNegativeFunding ? "long-perp" : "short-perp";
+              const legLabel = side === "short-perp"
+                ? "LONG spot + SHORT perp"
+                : "SHORT spot + LONG perp";
+              logger.trade(`[DEMO] ${asset} ${tradeType}: ${legLabel} $${executionSizeUSD.toFixed(0)}`);
+              strategyEngine.setState(asset, tradeType === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL" : "BASIS_TRADE");
+              currentStrategies[asset] = tradeType;
+              // Store both legs so risk engine sees near-zero net delta
               positions.set(`${asset}_SPOT`, {
                 asset,
-                baseAmount: deltaCapitalAsset / snap.spotPrice,
-                quoteAmount: deltaCapitalAsset,
+                baseAmount: executionSizeUSD / snap.spotPrice,
+                quoteAmount: executionSizeUSD,
                 entryPrice: snap.spotPrice,
                 markPrice: snap.spotPrice,
                 unrealizedPnl: 0,
-                direction: "LONG",
+                direction: side === "short-perp" ? "LONG" : "SHORT",
               });
               positions.set(`${asset}_PERP`, {
                 asset,
-                baseAmount: deltaCapitalAsset / snap.perpPrice,
-                quoteAmount: deltaCapitalAsset,
+                baseAmount: executionSizeUSD / snap.perpPrice,
+                quoteAmount: executionSizeUSD,
                 entryPrice: snap.perpPrice,
                 markPrice: snap.perpPrice,
                 unrealizedPnl: 0,
-                direction: "SHORT",
+                direction: side === "short-perp" ? "SHORT" : "LONG",
               });
-              await telegram.tradeOpened(asset, "DELTA_NEUTRAL", deltaCapitalAsset);
+              await telegram.tradeOpened(asset, tradeType, executionSizeUSD);
               executionData.executedTrade = true;
+              executionData.events.push(`${asset}: ${legLabel} ($${executionSizeUSD.toFixed(0)})`);
+              strategyData.deltaCapital += executionSizeUSD;
+              tradeCarryOver[asset] = Math.max(0, requestedExecutionUSD - executionSizeUSD);
+            }
+
+            if (!DEMO_MODE) {
+              const liveExec = await handleSignalLive(signal, asset, executionSizeUSD, execEngine, positions, logger);
+              if (liveExec.events.length > 0) {
+                executionData.events.push(...liveExec.events);
+              }
+              if (liveExec.executed) {
+                executionData.executedTrade = true;
+                strategyData.deltaCapital += executionSizeUSD;
+                tradeCarryOver[asset] = Math.max(0, requestedExecutionUSD - executionSizeUSD);
+              } else {
+                releaseTradeCapital(executionSizeUSD, capitalState, totalCapital);
+                capitalData.releasedFromTrades += executionSizeUSD;
+                tradeCarryOver[asset] = requestedExecutionUSD;
+              }
             }
           }
-        }
-
-        if (lendingCapitalAsset > 1000) {
-          const yieldEarned = await deployToLending(asset, lendingCapitalAsset);
-          lendingData.deployed += lendingCapitalAsset;
-          lendingData.yieldEarned += yieldEarned;
+        } else {
+          if ((tradeCarryOver[asset] ?? 0) > 0) {
+            const before = tradeCarryOver[asset];
+            tradeCarryOver[asset] = parseFloat((before * CARRYOVER_DECAY).toFixed(2));
+            if (tradeCarryOver[asset] < 1) {
+              tradeCarryOver[asset] = 0;
+              executionData.events.push(`${asset}: carryover expired (decayed to zero)`);
+            } else {
+              executionData.events.push(`${asset}: carryover decayed $${before.toFixed(0)} → $${tradeCarryOver[asset].toFixed(0)} (signal: ${signal.signal})`);
+            }
+          } else {
+            executionData.events.push(`${asset}: ${signal.signal}`);
+          }
         }
 
         // Update strategy state
@@ -408,8 +569,25 @@ async function main() {
           currentStrategies[asset] = "LENDING";
         }
 
-        if (!DEMO_MODE) {
-          await handleSignalLive(signal, asset, execEngine, positions, logger);
+      }
+
+      // Lend only leftover capital after all trade reservations/executions.
+      capitalData.remainingBeforeLending = capitalState.availableCapital;
+      const lendingAmount = allocateForLending(capitalState);
+      capitalData.lent = lendingAmount;
+      capitalData.remainingAfterLending = capitalState.availableCapital;
+      const plannedLendingTotal = plannedLendingByAsset.BTC + plannedLendingByAsset.ETH;
+      for (const asset of ["BTC", "ETH"] as const) {
+        const weight = plannedLendingTotal > 0 ? plannedLendingByAsset[asset] / plannedLendingTotal : 0.5;
+        const lendingCapitalAsset = lendingAmount * weight;
+        if (lendingCapitalAsset > 1000) {
+          const yieldEarned = await deployToLending(asset, lendingCapitalAsset);
+          lendingData.deployed += lendingCapitalAsset;
+          lendingData.yieldEarned += yieldEarned;
+          lendingData.byAsset[asset].amount += lendingCapitalAsset;
+          lendingData.byAsset[asset].yield += yieldEarned;
+          executionData.events.push(`${asset}: lending deployed ($${lendingCapitalAsset.toFixed(0)})`);
+          strategyData.lendingCapital += lendingCapitalAsset;
         }
       }
 
@@ -424,6 +602,67 @@ async function main() {
       };
       const currentMetrics = riskEngine.assess(nav, VAULT_EQUITY * 0.8, Array.from(positions.values()), currentConditions);
       const deltaExposure = currentMetrics.deltaExposurePct;
+
+      botState.timestamp = Date.now();
+      botState.tick = tick;
+      botState.prices = {
+        BTC: marketData.BTC?.price ?? 0,
+        ETH: marketData.ETH?.price ?? 0,
+      };
+      botState.funding = {
+        BTC: marketData.BTC?.fr ?? 0,
+        ETH: marketData.ETH?.fr ?? 0,
+      };
+      botState.basis = {
+        BTC: marketData.BTC?.basis ?? 0,
+        ETH: marketData.ETH?.basis ?? 0,
+      };
+      botState.signals = {
+        BTC: currentStrategies.BTC ?? "PARKED",
+        ETH: currentStrategies.ETH ?? "PARKED",
+      };
+      botState.positionsCount = positions.size;
+      botState.nav = nav;
+      botState.pnl = pnl;
+      botState.drawdown = drawdown;
+      botState.deltaExposure = deltaExposure;
+      botState.lending = {
+        deployed: lendingData.deployed,
+        yield: lendingData.yieldEarned,
+      };
+      botState.lendingByAsset = lendingData.byAsset;
+      botState.executionEvents = [...executionData.events];
+      botState.execution = {
+        executedTrade: executionData.executedTrade,
+        events: [...executionData.events],
+      };
+      capitalData.carryOver = {
+        BTC: tradeCarryOver.BTC,
+        ETH: tradeCarryOver.ETH,
+        total: tradeCarryOver.BTC + tradeCarryOver.ETH,
+      };
+      botState.capital = {
+        starting: capitalData.starting,
+        reservedForTrades: capitalData.reservedForTrades,
+        releasedFromTrades: capitalData.releasedFromTrades,
+        lent: capitalData.lent,
+        remainingBeforeLending: capitalData.remainingBeforeLending,
+        remainingAfterLending: capitalData.remainingAfterLending,
+        carryOver: { ...capitalData.carryOver },
+      };
+      botState.positions = Array.from(positions.entries()).map(([key, pos]) => ({
+        key,
+        asset: pos.asset,
+        leg: key.includes("_SPOT") ? "SPOT" : "PERP",
+        direction: pos.direction,
+        notional: pos.quoteAmount,
+        pnl: pos.unrealizedPnl ?? 0,
+      }));
+      botState.crossChain = {
+        currentChains: { ...currentChains },
+        decisions: { ...latestCrossChainDecisions },
+        fundingByChain: latestFundingByChain,
+      };
 
       // ── Organized Logging ───────────────────────────────────────────────────
       logSection(`Cycle #${tick}`);
@@ -446,12 +685,25 @@ async function main() {
         console.log(`Lending Allocation: $${strategyData.lendingCapital.toFixed(2)}`);
       }
 
+      // [CAPITAL]
+      console.log(`\n${chalk.white('[CAPITAL]')}`);
+      console.log(`Starting: $${capitalData.starting.toFixed(2)}`);
+      console.log(`Reserved For Trades: $${capitalData.reservedForTrades.toFixed(2)}`);
+      console.log(`Released From Failed/Skipped: $${capitalData.releasedFromTrades.toFixed(2)}`);
+      console.log(`Remaining Before Lending: $${capitalData.remainingBeforeLending.toFixed(2)}`);
+      console.log(`Lent (Leftover): $${capitalData.lent.toFixed(2)}`);
+      console.log(`Remaining After Lending: $${capitalData.remainingAfterLending.toFixed(2)}`);
+      console.log(`CarryOver BTC: $${tradeCarryOver.BTC.toFixed(2)} | ETH: $${tradeCarryOver.ETH.toFixed(2)} | Total: $${(tradeCarryOver.BTC + tradeCarryOver.ETH).toFixed(2)}`);
+
       // [EXECUTION]
       console.log(`\n${chalk.green('[EXECUTION]')}`);
       if (executionData.executedTrade) {
-        console.log(`${chalk.green('✔')} Delta-neutral position opened`);
+        console.log(`${chalk.green('✔')} Trade(s) executed`);
       } else {
         console.log(`${chalk.gray('•')} No trade executed`);
+      }
+      for (const event of executionData.events) {
+        console.log(`- ${event}`);
       }
 
       // [RISK]
@@ -496,25 +748,49 @@ async function main() {
 async function handleSignalLive(
   signal: Signal,
   asset: "BTC" | "ETH",
+  executionSizeUSD: number,
   exec: LiveExecutionEngine,
   positions: Map<string, any>,
   logger: Logger
-) {
+): Promise<{ executed: boolean; events: string[] }> {
+  const events: string[] = [];
+  let executed = false;
+
   switch (signal.signal) {
     case "DELTA_NEUTRAL_OPEN":
     case "BASIS_TRADE_OPEN": {
-      if (positions.has(`${asset}_SPOT`)) break;
+      if (executionSizeUSD < MIN_TRADE_SIZE) {
+        events.push(`${asset}: skipped open (size ${executionSizeUSD.toFixed(0)} below minimum ${MIN_TRADE_SIZE})`);
+        break;
+      }
+      if (positions.has(`${asset}_SPOT`)) {
+        events.push(`${asset}: already open`);
+        break;
+      }
       const type = signal.signal === "DELTA_NEUTRAL_OPEN" ? "DELTA_NEUTRAL" : "BASIS_TRADE";
-      const pos  = await exec.openDeltaNeutral(asset, signal.suggestedSizeUSD, signal.metadata.fundingRate);
+      const side = signal.metadata.fundingRate < 0 ? "long-perp" : "short-perp";
+      const pos  = await exec.openDeltaNeutral({
+        side,
+        asset,
+        amount: executionSizeUSD,
+        fundingRate: signal.metadata.fundingRate,
+      });
       if (pos) {
         positions.set(asset, pos);
-        await telegram.tradeOpened(asset, type, signal.suggestedSizeUSD);
+        await telegram.tradeOpened(asset, type, executionSizeUSD);
+        executed = true;
+        events.push(`${asset}: ${type} opened ($${executionSizeUSD.toFixed(0)})`);
+      } else {
+        events.push(`${asset}: ${type} open failed`);
       }
       break;
     }
     case "DELTA_NEUTRAL_CLOSE":
     case "BASIS_TRADE_CLOSE": {
-      if (!positions.has(`${asset}_SPOT`)) break;
+      if (!positions.has(`${asset}_SPOT`)) {
+        events.push(`${asset}: no open position to close`);
+        break;
+      }
       await exec.closeDeltaNeutral(asset);
       const spotPos = positions.get(`${asset}_SPOT`);
       const perpPos = positions.get(`${asset}_PERP`);
@@ -522,9 +798,17 @@ async function handleSignalLive(
       await telegram.tradeClosed(asset, combinedPnl);
       positions.delete(`${asset}_SPOT`);
       positions.delete(`${asset}_PERP`);
+      executed = true;
+      events.push(`${asset}: position closed (PnL $${combinedPnl.toFixed(2)})`);
+      break;
+    }
+    default: {
+      events.push(`${asset}: ${signal.signal}`);
       break;
     }
   }
+
+  return { executed, events };
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));

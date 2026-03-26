@@ -6,6 +6,8 @@
 import { CROSS_CHAIN_CONFIG } from "../config/crossChain";
 import { Logger } from "../logger";
 
+type FundingAsset = "BTC" | "ETH";
+
 // Mock bridge function (replace with real bridge SDK)
 async function bridgeFunds({
   fromChain,
@@ -23,23 +25,25 @@ async function closePosition(chain: string): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, 1000));
 }
 
-async function openDeltaNeutralPosition({ chain, amount }: { chain: string; amount: number }): Promise<void> {
-  console.log(`Opening delta-neutral position on ${chain} with $${amount.toFixed(0)}`);
+async function openDeltaNeutralPosition({ chain, amount, asset }: { chain: string; amount: number; asset: FundingAsset }): Promise<void> {
+  console.log(`Opening ${asset} delta-neutral position on ${chain} with $${amount.toFixed(0)}`);
   await new Promise(resolve => setTimeout(resolve, 1000));
 }
 
 export async function executeCrossChain({
+  asset,
   fromChain,
   toChain,
   amount,
   logger,
 }: {
+  asset: FundingAsset;
   fromChain: string;
   toChain: string;
   amount: number;
   logger: Logger;
 }): Promise<{ success: boolean; simulated?: boolean }> {
-  logger.info(`🚀 Cross-chain execution: ${fromChain} → ${toChain}, amount=$${amount.toFixed(0)}`);
+  logger.info(`🚀 Cross-chain execution (${asset}): ${fromChain} → ${toChain}, amount=$${amount.toFixed(0)}`);
 
   if (CROSS_CHAIN_CONFIG.SIMULATION_MODE) {
     logger.info("🧪 SIMULATION MODE — no real bridge");
@@ -57,9 +61,9 @@ export async function executeCrossChain({
     }
 
     // 3. Open new position
-    await openDeltaNeutralPosition({ chain: toChain, amount });
+    await openDeltaNeutralPosition({ chain: toChain, amount, asset });
 
-    logger.info(`✅ Cross-chain move completed: ${fromChain} → ${toChain}`);
+    logger.info(`✅ Cross-chain move completed (${asset}): ${fromChain} → ${toChain}`);
     return { success: true };
   } catch (err: any) {
     logger.error(`❌ Cross-chain execution failed: ${err.message}`);

@@ -28,12 +28,13 @@ export const RISK_LIMITS = {
   MIN_COLLATERAL_RATIO:    0.20,   // 20% free collateral — halt entries
 
   // New: market conditions
-  MAX_FUNDING_VOLATILITY:  0.50,   // Funding rate std dev / mean > 0.5 = chaotic
+  MAX_FUNDING_VOLATILITY:  0.20,   // Relative funding jump > 0.2 = chaotic
   MAX_SOLANA_LATENCY_MS:   500,    // RPC round-trip > 500ms = congested
   MAX_ORACLE_STALENESS_S:  30,     // Pyth price age > 30s = stale
 
   // Position sizing reduction when conditions are adverse
   REDUCE_SIZE_FACTOR:      0.50,   // Cut position sizes by 50% in adverse conditions
+  FUNDING_VOL_WARMUP_SAMPLES: 4,   // Wait for enough smoothed samples before volatility checks
 } as const;
 
 // ─── Risk action types ────────────────────────────────────────────────────────
@@ -83,6 +84,8 @@ export class EnhancedRiskEngine {
   private haltNewTrades: boolean = false;
   private pauseExecution: boolean = false;
   private recentFundingRates: Record<string, number[]> = { BTC: [], ETH: [] };
+  private smoothedFunding: Record<string, number> = { BTC: 0, ETH: 0 };
+  private fundingSizeReduced: boolean = false;
 
   constructor(initialEquity: number, logger: Logger) {
     this.highWaterMark = initialEquity;
@@ -91,9 +94,11 @@ export class EnhancedRiskEngine {
 
   // ── Record a funding rate observation for volatility calculation ────────────
   recordFundingRate(asset: string, rate: number): void {
+    const sanitized = this.sanitizeFunding(rate);
     const history = this.recentFundingRates[asset] ?? [];
-    history.push(rate);
-    if (history.length > 20) history.shift(); // keep last 20 readings
+    const smoothed = this.smoothFunding(asset, sanitized, history.length === 0);
+    history.push(smoothed);
+    if (history.length > 20) history.shift(); // keep last 20 smoothed readings
     this.recentFundingRates[asset] = history;
   }
 
@@ -169,8 +174,16 @@ export class EnhancedRiskEngine {
     const fundingVolatility = this.computeFundingVolatility();
     if (fundingVolatility > RISK_LIMITS.MAX_FUNDING_VOLATILITY) {
       sizingMultiplier *= RISK_LIMITS.REDUCE_SIZE_FACTOR;
-      this.logEvent(events, "REDUCE_SIZE", "MEDIUM",
-        `Funding rate volatility ${fundingVolatility.toFixed(2)} > ${RISK_LIMITS.MAX_FUNDING_VOLATILITY} — reducing position sizes by 50%`);
+      if (!this.fundingSizeReduced) {
+        this.fundingSizeReduced = true;
+        this.logEvent(events, "REDUCE_SIZE", "MEDIUM",
+          `Funding rate volatility ${fundingVolatility.toFixed(2)} > ${RISK_LIMITS.MAX_FUNDING_VOLATILITY} — reducing position sizes by 50%`);
+      }
+    } else if (this.fundingSizeReduced) {
+      this.fundingSizeReduced = false;
+      this.logger.info(
+        `RiskEngine: Funding volatility normalized (${fundingVolatility.toFixed(2)}) — size reduction cleared`
+      );
     }
 
     // ── CHECK 6 (NEW): Solana network congestion ─────────────────────────────
@@ -218,16 +231,38 @@ export class EnhancedRiskEngine {
     };
   }
 
-  // ── Compute funding rate volatility (coefficient of variation) ──────────────
+  private sanitizeFunding(rate: number): number {
+    return Math.max(Math.min(rate, 0.005), -0.005);
+  }
+
+  private smoothFunding(asset: string, newValue: number, isFirstSample = false): number {
+    if (isFirstSample) {
+      this.smoothedFunding[asset] = newValue;
+      return newValue;
+    }
+    const previous = this.smoothedFunding[asset] ?? 0;
+    const smoothed = 0.8 * previous + 0.2 * newValue;
+    this.smoothedFunding[asset] = smoothed;
+    return smoothed;
+  }
+
+  private calculateFundingVolatility(current: number, previous: number): number {
+    const diff = Math.abs(current - previous);
+    const base = Math.max(Math.abs(previous), 0.0001);
+    return diff / base;
+  }
+
+  // ── Compute funding rate volatility (relative jump, smoothed) ───────────────
   private computeFundingVolatility(): number {
-    const allRates = Object.values(this.recentFundingRates).flat();
-    if (allRates.length < 4) return 0;
-
-    const mean = allRates.reduce((s, r) => s + r, 0) / allRates.length;
-    if (mean === 0) return 0;
-
-    const variance = allRates.reduce((s, r) => s + Math.pow(r - mean, 2), 0) / allRates.length;
-    return Math.sqrt(variance) / Math.abs(mean); // coefficient of variation
+    const perAssetVols: number[] = [];
+    for (const history of Object.values(this.recentFundingRates)) {
+      if (history.length < RISK_LIMITS.FUNDING_VOL_WARMUP_SAMPLES) continue;
+      const previous = history[history.length - 2];
+      const current = history[history.length - 1];
+      perAssetVols.push(this.calculateFundingVolatility(current, previous));
+    }
+    if (perAssetVols.length === 0) return 0;
+    return perAssetVols.reduce((sum, v) => sum + v, 0) / perAssetVols.length;
   }
 
   private logEvent(
