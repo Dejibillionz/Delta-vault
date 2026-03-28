@@ -66,6 +66,10 @@ export class StrategyEngine {
   private logger: Logger;
   private state: ActiveState = { BTC: "NONE", ETH: "NONE" };
   private vaultEquity: number = 100_000; // updated externally
+  // Tracks the funding direction of the currently open delta-neutral position.
+  // +1 = entered on positive funding (long spot / short perp)
+  // -1 = entered on negative funding (short spot / long perp)
+  private fundingDir: Record<"BTC" | "ETH", 1 | -1> = { BTC: 1, ETH: 1 };
 
   constructor(logger: Logger) {
     this.logger = logger;
@@ -93,16 +97,25 @@ export class StrategyEngine {
 
     // ── EXIT CONDITIONS ──────────────────────────────────────────────────────
 
-    if (currentState === "DELTA_NEUTRAL" && fundingRate < THRESHOLDS.FUNDING_RATE_EXIT) {
-      this.logger.info(`${asset} funding dropped below exit threshold — signaling close`);
-      return {
-        asset,
-        signal: "DELTA_NEUTRAL_CLOSE",
-        reason: `Funding rate ${pct(fundingRate)} fell below exit threshold ${pct(THRESHOLDS.FUNDING_RATE_EXIT)}`,
-        urgency: "MEDIUM",
-        suggestedSizeUSD: 0,
-        metadata: meta,
-      };
+    if (currentState === "DELTA_NEUTRAL") {
+      const dir = this.fundingDir[asset as "BTC" | "ETH"];
+      // effectiveFunding is the yield we are collecting — positive means we are still earning
+      const effectiveFunding = fundingRate * dir;
+      const regimeFlipped = effectiveFunding < -(THRESHOLDS.FUNDING_RATE_MIN * 2);
+      if (regimeFlipped || effectiveFunding < THRESHOLDS.FUNDING_RATE_EXIT) {
+        const reason = regimeFlipped
+          ? `Funding regime flipped — reversing to ${dir < 0 ? "LONG spot + SHORT perp" : "SHORT spot + LONG perp"}`
+          : `Effective funding ${pct(effectiveFunding)} fell below exit threshold — closing`;
+        this.logger.info(`${asset} ${reason}`);
+        return {
+          asset,
+          signal: "DELTA_NEUTRAL_CLOSE",
+          reason,
+          urgency: regimeFlipped ? "HIGH" : "MEDIUM",
+          suggestedSizeUSD: 0,
+          metadata: meta,
+        };
+      }
     }
 
     if (currentState === "BASIS_TRADE" && basisSpread < THRESHOLDS.BASIS_SPREAD_EXIT) {
@@ -125,6 +138,7 @@ export class StrategyEngine {
         Math.abs(fundingRate) > THRESHOLDS.FUNDING_RATE_MIN &&
         liquidityScore >= THRESHOLDS.MIN_LIQUIDITY_SCORE
       ) {
+        this.fundingDir[asset as "BTC" | "ETH"] = fundingRate >= 0 ? 1 : -1;
         const size = this.sizeDeltaNeutral(fundingRate, maxSize);
         const fundingDirection = fundingRate >= 0 ? "positive" : "negative";
         this.logger.trade(

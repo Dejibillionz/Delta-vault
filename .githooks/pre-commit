@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Allow emergency override, e.g. SKIP_SECRET_SCAN=1 git commit -m "..."
+if [[ "${SKIP_SECRET_SCAN:-0}" == "1" ]]; then
+  echo "[secret-scan] skipped (SKIP_SECRET_SCAN=1)"
+  exit 0
+fi
+
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+if [[ -z "$staged_files" ]]; then
+  exit 0
+fi
+
+# Block committing obvious secret container files.
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+
+  if [[ "$file" =~ (^|/)\.env$ ]] ||
+     [[ "$file" =~ (^|/)\.env\.(local|development|production|test|staging)$ ]] ||
+     [[ "$file" =~ (^|/)keypair\.json$ ]] ||
+     [[ "$file" =~ (^|/).+\.(pem|key)$ ]] ||
+     [[ "$file" =~ (^|/)id_rsa(\.pub)?$ ]]; then
+    echo ""
+    echo "[secret-scan] blocked: staged file looks sensitive -> $file"
+    echo "[secret-scan] remove it from commit: git restore --staged \"$file\""
+    exit 1
+  fi
+done <<< "$staged_files"
+
+# Scan only added lines in staged diff to reduce noise from existing content.
+secret_regex='(-----BEGIN [A-Z ]*PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{36}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|("privateKey"|"secretKey"|"mnemonic")\s*:|PRIVATE_KEY\s*=|SECRET_KEY\s*=)'
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+
+  added_lines="$(git diff --cached -- "$file" | sed -n '/^+/p' | sed '/^+++/d')"
+  [[ -z "$added_lines" ]] && continue
+
+  if grep -Eiq "$secret_regex" <<< "$added_lines"; then
+    echo ""
+    echo "[secret-scan] blocked: possible secret detected in staged changes -> $file"
+    echo "[secret-scan] review with: git diff --cached -- \"$file\""
+    exit 1
+  fi
+done <<< "$staged_files"
+
+echo "[secret-scan] passed"

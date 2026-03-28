@@ -30,6 +30,10 @@ import { telegram }                                  from "./telegramAlerts";
 import { ServerWallet }                              from "./walletIntegration";
 import { THRESHOLDS }                                from "./strategyEngine";
 import { debugLog, LogLevel }                        from "./logging";
+import { decide, AgentObservation }                  from "./agent/decision";
+import { getPositionSize }                           from "./agent/sizing";
+import { createInitialState, updateState }           from "./agent/state";
+import { logAgent, logDecision }                     from "./agent/logger";
 
 // Cross-chain imports
 import { getCrossChainFunding }                       from "./services/crossChainFunding";
@@ -54,6 +58,7 @@ const RISK_CYCLE_MS = 10_000;
 const VAULT_EQUITY  = 250_000;
 const MIN_TRADE_SIZE = 1_000;
 const CARRYOVER_DECAY = 0.75; // Retain 75% of carryover per cycle when signal is absent
+const AI_AGENT_ENABLED = process.env.AI_AGENT_ENABLED !== "false";
 
 const logger = new Logger("./logs");
 
@@ -140,6 +145,7 @@ async function main() {
   let previousSnapshots: Record<string, LiveMarketSnapshot> = {};
   let latestDrawdown = 0;
   let tradeCarryOver: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
+  const aiAgentState = createInitialState();
 
   // Cross-chain state (independent by asset)
   const currentChains: Record<"BTC" | "ETH", string> = { BTC: "solana", ETH: "solana" };
@@ -182,6 +188,17 @@ async function main() {
       currentChains,
       decisions: latestCrossChainDecisions,
       fundingByChain: latestFundingByChain,
+    },
+    aiAgent: {
+      enabled: AI_AGENT_ENABLED,
+      observation: { btcFunding: 0, ethFunding: 0, volatility: 0 },
+      decision: null,
+      maxSize: 0,
+      state: {
+        winRate: aiAgentState.winRate,
+        confidence: aiAgentState.confidence,
+        performance: { ...aiAgentState.performance },
+      },
     },
   };
 
@@ -396,6 +413,20 @@ async function main() {
       };
       const plannedLendingByAsset: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
 
+      const agentObservation: AgentObservation = {
+        btcFunding: btcSnap?.fundingRate ?? 0,
+        ethFunding: ethSnap?.fundingRate ?? 0,
+        volatility:
+          Math.abs((btcSnap?.fundingRate ?? 0) - (ethSnap?.fundingRate ?? 0)) /
+          Math.max(Math.abs((btcSnap?.fundingRate ?? 0) + (ethSnap?.fundingRate ?? 0)) / 2, 0.0001),
+      };
+      const agentDecision = AI_AGENT_ENABLED ? decide(agentObservation, aiAgentState) : null;
+      const agentMaxSize = AI_AGENT_ENABLED ? getPositionSize(aiAgentState, agentObservation.volatility) : 0;
+      if (agentDecision) {
+        logAgent("Observing market...");
+        logDecision(agentDecision);
+      }
+
       // Per-asset strategy
       for (const asset of ["BTC", "ETH"] as const) {
         const snap = marketEngine.getSnapshot(asset);
@@ -466,87 +497,126 @@ async function main() {
         const isOpenSignal = signal.signal === "DELTA_NEUTRAL_OPEN" || signal.signal === "BASIS_TRADE_OPEN";
         let executionSizeUSD = 0;
         if (isOpenSignal) {
-          const requestedExecutionUSD = Math.min(
-            capitalPerAsset,
-            Math.max(0, deltaCapitalAsset + (tradeCarryOver[asset] ?? 0))
-          );
+          const blockedByAgent =
+            (agentDecision?.action === "SKIP") ||
+            (agentDecision?.action === "TRADE" && agentDecision.asset !== asset);
 
-          const reservableAmount = Math.min(requestedExecutionUSD, capitalState.availableCapital);
-          if (reservableAmount > 0) {
-            executionSizeUSD = allocateForTrade(reservableAmount, capitalState);
-            capitalData.reservedForTrades += executionSizeUSD;
-          }
-
-          if (executionSizeUSD < MIN_TRADE_SIZE && executionSizeUSD > 0) {
-            releaseTradeCapital(executionSizeUSD, capitalState, totalCapital);
-            capitalData.releasedFromTrades += executionSizeUSD;
-            tradeCarryOver[asset] = requestedExecutionUSD;
-            executionData.events.push(
-              `${asset}: accumulated $${tradeCarryOver[asset].toFixed(0)} (below minimum ${MIN_TRADE_SIZE})`
+          if (blockedByAgent) {
+            if (agentDecision?.action === "SKIP") {
+              executionData.events.push(`${asset}: AI agent skipped (${agentDecision.reason})`);
+            } else if (agentDecision?.action === "TRADE") {
+              executionData.events.push(`${asset}: AI agent selected ${agentDecision.asset}`);
+            }
+          } else {
+            const requestedExecutionUSDRaw = Math.min(
+              capitalPerAsset,
+              Math.max(0, deltaCapitalAsset + (tradeCarryOver[asset] ?? 0))
             );
-            executionSizeUSD = 0;
-          }
+            const effectiveAgentCap = AI_AGENT_ENABLED
+              ? Math.max(agentMaxSize, MIN_TRADE_SIZE)
+              : requestedExecutionUSDRaw;
+            const requestedExecutionUSD = AI_AGENT_ENABLED
+              ? Math.min(requestedExecutionUSDRaw, effectiveAgentCap)
+              : requestedExecutionUSDRaw;
 
-          if (executionSizeUSD <= 0 && requestedExecutionUSD > 0) {
-            tradeCarryOver[asset] = requestedExecutionUSD;
-            executionData.events.push(`${asset}: waiting to accumulate ($${tradeCarryOver[asset].toFixed(0)})`);
-          }
+            executionData.events.push(
+              `${asset}: sizing raw=$${requestedExecutionUSDRaw.toFixed(0)} | aiCap=$${effectiveAgentCap.toFixed(0)} | final=$${requestedExecutionUSD.toFixed(0)}`
+            );
 
-          if (executionSizeUSD >= MIN_TRADE_SIZE) {
-            if (DEMO_MODE) {
-              const tradeType = signal.signal === "DELTA_NEUTRAL_OPEN" ? "DELTA_NEUTRAL" : "BASIS_TRADE";
-              const isNegativeFunding = signal.signal === "DELTA_NEUTRAL_OPEN" && signal.metadata.fundingRate < 0;
-              const side = isNegativeFunding ? "long-perp" : "short-perp";
-              const legLabel = side === "short-perp"
-                ? "LONG spot + SHORT perp"
-                : "SHORT spot + LONG perp";
-              logger.trade(`[DEMO] ${asset} ${tradeType}: ${legLabel} $${executionSizeUSD.toFixed(0)}`);
-              strategyEngine.setState(asset, tradeType === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL" : "BASIS_TRADE");
-              currentStrategies[asset] = tradeType;
-              // Store both legs so risk engine sees near-zero net delta
-              positions.set(`${asset}_SPOT`, {
-                asset,
-                baseAmount: executionSizeUSD / snap.spotPrice,
-                quoteAmount: executionSizeUSD,
-                entryPrice: snap.spotPrice,
-                markPrice: snap.spotPrice,
-                unrealizedPnl: 0,
-                direction: side === "short-perp" ? "LONG" : "SHORT",
-              });
-              positions.set(`${asset}_PERP`, {
-                asset,
-                baseAmount: executionSizeUSD / snap.perpPrice,
-                quoteAmount: executionSizeUSD,
-                entryPrice: snap.perpPrice,
-                markPrice: snap.perpPrice,
-                unrealizedPnl: 0,
-                direction: side === "short-perp" ? "SHORT" : "LONG",
-              });
-              await telegram.tradeOpened(asset, tradeType, executionSizeUSD);
-              executionData.executedTrade = true;
-              executionData.events.push(`${asset}: ${legLabel} ($${executionSizeUSD.toFixed(0)})`);
-              strategyData.deltaCapital += executionSizeUSD;
-              tradeCarryOver[asset] = Math.max(0, requestedExecutionUSD - executionSizeUSD);
+            const reservableAmount = Math.min(requestedExecutionUSD, capitalState.availableCapital);
+            if (reservableAmount > 0) {
+              executionSizeUSD = allocateForTrade(reservableAmount, capitalState);
+              capitalData.reservedForTrades += executionSizeUSD;
             }
 
-            if (!DEMO_MODE) {
-              const liveExec = await handleSignalLive(signal, asset, executionSizeUSD, execEngine, positions, logger);
-              if (liveExec.events.length > 0) {
-                executionData.events.push(...liveExec.events);
-              }
-              if (liveExec.executed) {
+            if (executionSizeUSD < MIN_TRADE_SIZE && executionSizeUSD > 0) {
+              releaseTradeCapital(executionSizeUSD, capitalState, totalCapital);
+              capitalData.releasedFromTrades += executionSizeUSD;
+              tradeCarryOver[asset] = requestedExecutionUSD;
+              executionData.events.push(
+                `${asset}: accumulated $${tradeCarryOver[asset].toFixed(0)} (below minimum ${MIN_TRADE_SIZE})`
+              );
+              executionSizeUSD = 0;
+            }
+
+            if (executionSizeUSD <= 0 && requestedExecutionUSD > 0) {
+              tradeCarryOver[asset] = requestedExecutionUSD;
+              executionData.events.push(`${asset}: waiting to accumulate ($${tradeCarryOver[asset].toFixed(0)})`);
+            }
+
+            if (executionSizeUSD >= MIN_TRADE_SIZE) {
+              if (DEMO_MODE) {
+                const tradeType = signal.signal === "DELTA_NEUTRAL_OPEN" ? "DELTA_NEUTRAL" : "BASIS_TRADE";
+                const isNegativeFunding = signal.signal === "DELTA_NEUTRAL_OPEN" && signal.metadata.fundingRate < 0;
+                const side = isNegativeFunding ? "long-perp" : "short-perp";
+                const legLabel = side === "short-perp"
+                  ? "LONG spot + SHORT perp"
+                  : "SHORT spot + LONG perp";
+                logger.trade(`[DEMO] ${asset} ${tradeType}: ${legLabel} $${executionSizeUSD.toFixed(0)}`);
+                strategyEngine.setState(asset, tradeType === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL" : "BASIS_TRADE");
+                currentStrategies[asset] = tradeType;
+                // Store both legs so risk engine sees near-zero net delta
+                positions.set(`${asset}_SPOT`, {
+                  asset,
+                  baseAmount: executionSizeUSD / snap.spotPrice,
+                  quoteAmount: executionSizeUSD,
+                  entryPrice: snap.spotPrice,
+                  markPrice: snap.spotPrice,
+                  unrealizedPnl: 0,
+                  direction: side === "short-perp" ? "LONG" : "SHORT",
+                });
+                positions.set(`${asset}_PERP`, {
+                  asset,
+                  baseAmount: executionSizeUSD / snap.perpPrice,
+                  quoteAmount: executionSizeUSD,
+                  entryPrice: snap.perpPrice,
+                  markPrice: snap.perpPrice,
+                  unrealizedPnl: 0,
+                  direction: side === "short-perp" ? "SHORT" : "LONG",
+                });
+                await telegram.tradeOpened(asset, tradeType, executionSizeUSD);
                 executionData.executedTrade = true;
+                executionData.events.push(`${asset}: ${legLabel} ($${executionSizeUSD.toFixed(0)})`);
                 strategyData.deltaCapital += executionSizeUSD;
                 tradeCarryOver[asset] = Math.max(0, requestedExecutionUSD - executionSizeUSD);
-              } else {
-                releaseTradeCapital(executionSizeUSD, capitalState, totalCapital);
-                capitalData.releasedFromTrades += executionSizeUSD;
-                tradeCarryOver[asset] = requestedExecutionUSD;
+                updateState(aiAgentState, { asset, pnl: (Math.random() - 0.45) * 20 });
+              }
+
+              if (!DEMO_MODE) {
+                const liveExec = await handleSignalLive(signal, asset, executionSizeUSD, execEngine, positions, logger);
+                if (liveExec.events.length > 0) {
+                  executionData.events.push(...liveExec.events);
+                }
+                if (liveExec.executed) {
+                  executionData.executedTrade = true;
+                  strategyData.deltaCapital += executionSizeUSD;
+                  tradeCarryOver[asset] = Math.max(0, requestedExecutionUSD - executionSizeUSD);
+                  if (typeof liveExec.realizedPnl === "number") {
+                    updateState(aiAgentState, { asset, pnl: liveExec.realizedPnl });
+                  }
+                } else {
+                  releaseTradeCapital(executionSizeUSD, capitalState, totalCapital);
+                  capitalData.releasedFromTrades += executionSizeUSD;
+                  tradeCarryOver[asset] = requestedExecutionUSD;
+                }
               }
             }
           }
         } else {
-          if ((tradeCarryOver[asset] ?? 0) > 0) {
+          if (signal.signal === "DELTA_NEUTRAL_CLOSE" || signal.signal === "BASIS_TRADE_CLOSE") {
+            // Close both legs and reset state so next cycle can re-enter (possibly reversed)
+            const hadSpot = positions.has(`${asset}_SPOT`);
+            const hadPerp = positions.has(`${asset}_PERP`);
+            if (hadSpot || hadPerp) {
+              positions.delete(`${asset}_SPOT`);
+              positions.delete(`${asset}_PERP`);
+              executionData.events.push(`${asset}: position closed — ${signal.reason}`);
+              executionData.executedTrade = true;
+            }
+            strategyEngine.setState(asset, "NONE");
+            currentStrategies[asset] = "PARKED";
+            tradeCarryOver[asset] = 0;
+          } else if ((tradeCarryOver[asset] ?? 0) > 0) {
             const before = tradeCarryOver[asset];
             tradeCarryOver[asset] = parseFloat((before * CARRYOVER_DECAY).toFixed(2));
             if (tradeCarryOver[asset] < 1) {
@@ -560,10 +630,16 @@ async function main() {
           }
         }
 
-        // Update strategy state
-        if (allocation.delta > allocation.lending) {
+        // Update strategy state — driven by actual open positions, NOT just allocation ratios.
+        // This ensures a CLOSE signal's state reset isn't overwritten by a blanket setState call.
+        const hasOpenDeltaPos = positions.has(`${asset}_SPOT`) || positions.has(`${asset}_PERP`);
+        if (hasOpenDeltaPos) {
           strategyEngine.setState(asset, "DELTA_NEUTRAL");
           currentStrategies[asset] = "DELTA_NEUTRAL";
+        } else if (allocation.delta > allocation.lending) {
+          // Allocation wants delta exposure but no position yet — stay NONE so engine can enter next cycle
+          strategyEngine.setState(asset, "NONE");
+          currentStrategies[asset] = "PARKED";
         } else {
           strategyEngine.setState(asset, "PARKED");
           currentStrategies[asset] = "LENDING";
@@ -663,6 +739,21 @@ async function main() {
         decisions: { ...latestCrossChainDecisions },
         fundingByChain: latestFundingByChain,
       };
+      botState.aiAgent = {
+        enabled: AI_AGENT_ENABLED,
+        observation: {
+          btcFunding: agentObservation.btcFunding,
+          ethFunding: agentObservation.ethFunding,
+          volatility: agentObservation.volatility,
+        },
+        decision: agentDecision,
+        maxSize: agentMaxSize,
+        state: {
+          winRate: aiAgentState.winRate,
+          confidence: aiAgentState.confidence,
+          performance: { ...aiAgentState.performance },
+        },
+      };
 
       // ── Organized Logging ───────────────────────────────────────────────────
       logSection(`Cycle #${tick}`);
@@ -719,6 +810,24 @@ async function main() {
         console.log(`Yield (cycle): +$${lendingData.yieldEarned.toFixed(4)}`);
       }
 
+      // [AI AGENT]
+      if (AI_AGENT_ENABLED) {
+        console.log(`\n${chalk.white('[AI AGENT]')}`);
+        console.log(
+          `Observation | BTC FR ${(agentObservation.btcFunding * 100).toFixed(3)}% | ` +
+          `ETH FR ${(agentObservation.ethFunding * 100).toFixed(3)}% | ` +
+          `Vol ${agentObservation.volatility.toFixed(3)}`
+        );
+        console.log(`Decision: ${JSON.stringify(agentDecision)}`);
+        console.log(`Max Size: $${agentMaxSize.toFixed(2)}`);
+        console.log(
+          `State | WinRate ${aiAgentState.winRate.toFixed(2)} | ` +
+          `Confidence ${aiAgentState.confidence.toFixed(2)} | ` +
+          `Perf BTC $${aiAgentState.performance.BTC.toFixed(2)} | ` +
+          `Perf ETH $${aiAgentState.performance.ETH.toFixed(2)}`
+        );
+      }
+
       // [SUMMARY]
       console.log(`\n${chalk.cyan('[SUMMARY]')}`);
       console.log(`PnL: +$${pnl.toFixed(2)} | Mode: ${mode}`);
@@ -752,9 +861,10 @@ async function handleSignalLive(
   exec: LiveExecutionEngine,
   positions: Map<string, any>,
   logger: Logger
-): Promise<{ executed: boolean; events: string[] }> {
+): Promise<{ executed: boolean; events: string[]; realizedPnl?: number }> {
   const events: string[] = [];
   let executed = false;
+  let realizedPnl: number | undefined = undefined;
 
   switch (signal.signal) {
     case "DELTA_NEUTRAL_OPEN":
@@ -795,6 +905,7 @@ async function handleSignalLive(
       const spotPos = positions.get(`${asset}_SPOT`);
       const perpPos = positions.get(`${asset}_PERP`);
       const combinedPnl = (spotPos?.unrealizedPnl ?? 0) + (perpPos?.unrealizedPnl ?? 0);
+      realizedPnl = combinedPnl;
       await telegram.tradeClosed(asset, combinedPnl);
       positions.delete(`${asset}_SPOT`);
       positions.delete(`${asset}_PERP`);
@@ -808,7 +919,7 @@ async function handleSignalLive(
     }
   }
 
-  return { executed, events };
+  return { executed, events, realizedPnl };
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));

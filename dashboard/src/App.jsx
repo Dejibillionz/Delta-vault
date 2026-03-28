@@ -219,7 +219,7 @@ function Log({ e }) {
 }
 
 // ── Signal pill ───────────────────────────────────────────────────────────────
-const SCOL = { DELTA_NEUTRAL: "#00ffa3", BASIS_TRADE: "#f59e0b", PARK_CAPITAL: "#5ba8d0", NONE: "#3a4e62" };
+const SCOL = { DELTA_NEUTRAL: "#00ffa3", DELTA_NEUTRAL_REVERSE: "#a78bfa", BASIS_TRADE: "#f59e0b", PARK_CAPITAL: "#5ba8d0", NONE: "#3a4e62" };
 function Pill({ label }) {
   const c = SCOL[label] || "#3a4e62";
   return (
@@ -301,6 +301,19 @@ export default function DeltaVault() {
     },
   });
 
+  // AI Agent
+  const [aiAgent, setAiAgent] = useState({
+    enabled: false,
+    mode: "Neutral",
+    confidence: 0.5,
+    lastDecision: "WAIT",
+    reason: "Initializing",
+    fundingSummary: "No signal",
+    crossChainSignal: false,
+    riskLevel: "Low",
+  });
+  const [aiDecisionPulse, setAiDecisionPulse] = useState(false);
+
   // Vault metrics
   const [vault, setVault] = useState({ nav: VAULT_INITIAL, pnl: 0, drawdown: 0, delta: 0, hwm: VAULT_INITIAL });
 
@@ -316,9 +329,22 @@ export default function DeltaVault() {
   const [tick,      setTick]      = useState(0);
   const logsRef = useRef(null);
   const lastSyncedTickRef = useRef(-1);
+  const lastAiDecisionRef = useRef("WAIT");
 
   const addLog = useCallback((type, msg) => {
     setLogs(p => [...p.slice(-200), { type, msg, time: ts(), id: Math.random() }]);
+  }, []);
+
+  const riskLevelFromMetrics = useCallback((drawdown, deltaExposure) => {
+    if (drawdown > 0.08 || deltaExposure > 0.06) return "High";
+    if (drawdown > 0.04 || deltaExposure > 0.04) return "Medium";
+    return "Low";
+  }, []);
+
+  const modeFromConfidence = useCallback((confidence) => {
+    if (confidence >= 0.66) return "Aggressive";
+    if (confidence <= 0.4) return "Conservative";
+    return "Neutral";
   }, []);
 
   // ── Pyth polling ──────────────────────────────────────────────────────────
@@ -412,12 +438,38 @@ export default function DeltaVault() {
             delta: d.deltaExposure ?? v.delta,
             hwm: Math.max(v.hwm, d.nav ?? 0),
           }));
+          setHPnl(h => [...h.slice(-49), d.pnl ?? 0]);
+          setHDraw(h => [...h.slice(-49), Math.max(0, (d.drawdown ?? 0) * 100)]);
           setCrossChain(prev => ({
             ...prev,
             currentChain: d.crossChain?.currentChains ?? prev.currentChain,
             decisions: d.crossChain?.decisions ?? prev.decisions,
             fundingByChain: d.crossChain?.fundingByChain ?? prev.fundingByChain,
           }));
+          const aiState = d.aiAgent?.state ?? {};
+          const aiDecision = d.aiAgent?.decision ?? null;
+          const confidence = aiState.confidence ?? aiDecision?.confidence ?? 0.5;
+          const mode = modeFromConfidence(confidence);
+          const fundingSummary = `BTC ${fmtPct(d.funding?.BTC ?? 0, 3)} | ETH ${fmtPct(d.funding?.ETH ?? 0, 3)}`;
+          const crossSignal = Object.values(d.crossChain?.decisions ?? {}).some(x => x?.execute);
+          const riskLevel = riskLevelFromMetrics(d.drawdown ?? 0, d.deltaExposure ?? 0);
+          setAiAgent({
+            enabled: d.aiAgent?.enabled ?? true,
+            mode,
+            confidence,
+            lastDecision:
+              aiDecision?.action === "TRADE"
+                ? `TRADE ${aiDecision.asset}`
+                : aiDecision?.action === "SKIP"
+                ? "SKIP"
+                : "WAIT",
+            reason:
+              aiDecision?.reason ??
+              (aiDecision?.action === "TRADE" ? "Funding edge selected" : "No qualified setup"),
+            fundingSummary,
+            crossChainSignal: crossSignal,
+            riskLevel,
+          });
           setTick(d.tick ?? 0);
           if ((d.tick ?? 0) !== lastSyncedTickRef.current) {
             lastSyncedTickRef.current = d.tick ?? 0;
@@ -440,7 +492,7 @@ export default function DeltaVault() {
       mounted = false;
       clearInterval(id);
     };
-  }, [addLog]);
+  }, [addLog, modeFromConfidence, riskLevelFromMetrics]);
 
   // ── Phantom wallet ────────────────────────────────────────────────────────
   const connectPhantom = useCallback(async () => {
@@ -473,9 +525,10 @@ export default function DeltaVault() {
   const evalSigs = (fr, bs) => {
     const s = {};
     for (const a of ASSETS) {
-      if (fr[a] > FUNDING_THRESHOLD) s[a] = "DELTA_NEUTRAL";
-      else if (bs[a] > BASIS_THRESHOLD) s[a] = "BASIS_TRADE";
-      else s[a] = "PARK_CAPITAL";
+      if (fr[a] > FUNDING_THRESHOLD)       s[a] = "DELTA_NEUTRAL";         // LONG spot + SHORT perp
+      else if (fr[a] < -FUNDING_THRESHOLD) s[a] = "DELTA_NEUTRAL_REVERSE"; // SHORT spot + LONG perp
+      else if (bs[a] > BASIS_THRESHOLD)    s[a] = "BASIS_TRADE";
+      else                                 s[a] = "PARK_CAPITAL";
     }
     return s;
   };
@@ -487,7 +540,8 @@ export default function DeltaVault() {
       setTick(t => t + 1);
 
       // Drift funding & basis walk (server-side in prod; simulated here)
-      setFunding(f => { const n = {}; ASSETS.forEach(a => { n[a] = clamp(f[a] + rand(-0.000012, 0.000014), 0.00002, 0.00042); }); return n; });
+      // Allow negative funding so the reverse strategy (short spot + long perp) can trigger
+      setFunding(f => { const n = {}; ASSETS.forEach(a => { n[a] = clamp(f[a] + rand(-0.000022, 0.000018), -0.00038, 0.00042); }); return n; });
       setBasis(b =>   { const n = {}; ASSETS.forEach(a => { n[a] = clamp(b[a] + rand(-0.0007, 0.0007), 0.0008, 0.022); });   return n; });
       setLiquidity(l =>{ const n = {}; ASSETS.forEach(a => { n[a] = clamp(l[a] + rand(-3e5,3e5), 1e6, 20e6); });            return n; });
 
@@ -541,32 +595,55 @@ export default function DeltaVault() {
             };
           });
 
+          const topAsset = fr.BTC >= fr.ETH ? "BTC" : "ETH";
+          const topFunding = fr[topAsset];
+          const confidence = clamp(0.45 + (Math.min(Math.abs(topFunding) * 1000, 0.35)), 0.35, 0.9);
+          const mode = modeFromConfidence(confidence);
+          const crossSignal = ASSETS.some(a => (crossChain.decisions[a]?.execute ?? false));
+          const riskLevel = riskLevelFromMetrics(vault.drawdown, vault.delta);
+          setAiAgent({
+            enabled: true,
+            mode,
+            confidence,
+            lastDecision: topFunding > FUNDING_THRESHOLD ? `TRADE ${topAsset}` : "SKIP",
+            reason: topFunding > FUNDING_THRESHOLD ? `${topAsset} funding leading` : "Funding below threshold",
+            fundingSummary: `BTC ${fmtPct(fr.BTC, 3)} | ETH ${fmtPct(fr.ETH, 3)}`,
+            crossChainSignal: crossSignal,
+            riskLevel,
+          });
+
           ASSETS.forEach(a => {
-            if (sigs[a] === "DELTA_NEUTRAL") {
+            const sig = sigs[a];
+            if (sig === "DELTA_NEUTRAL" || sig === "DELTA_NEUTRAL_REVERSE") {
+              const expectedType = sig;
+              const label = sig === "DELTA_NEUTRAL" ? "LONG spot + SHORT perp" : "SHORT spot + LONG perp";
+              const action = sig === "DELTA_NEUTRAL" ? "PERP SHORT + SPOT LONG" : "PERP LONG + SPOT SHORT";
               setPositions(p => {
-                if (p.find(x => x.asset === a)) return p;
+                // Close any position in the opposite direction (regime flip)
+                const opposite = p.find(x => x.asset === a && x.type !== expectedType && x.type !== "BASIS_TRADE");
+                if (opposite) {
+                  addLog("TRADE", `${a}: funding regime flipped — closing ${opposite.type}, opening ${expectedType}`);
+                  p = p.filter(x => !(x.asset === a && x.type !== expectedType && x.type !== "BASIS_TRADE"));
+                }
+                if (p.find(x => x.asset === a && x.type === expectedType)) return p;
                 const sz = rand(4000, 18000);
-                addLog("TRADE", `${a} DELTA_NEUTRAL — spot long + perp short $${sz.toFixed(0)} on Drift`);
-                setOrders(o => [{
-                  id: Date.now(), time: ts(), asset: a,
-                  action: "PERP SHORT + SPOT LONG", size: sz, status: "FILLED",
-                }, ...o.slice(0, 9)]);
-                return [...p, { asset: a, type: "DELTA_NEUTRAL", size: sz, pnl: 0, opened: ts() }];
+                addLog("TRADE", `[SIM] ${a} ${expectedType} — ${label} $${sz.toFixed(0)} on Drift`);
+                setOrders(o => [{ id: Date.now(), time: ts(), asset: a, action, size: sz, status: "FILLED" }, ...o.slice(0, 9)]);
+                return [...p, { asset: a, type: expectedType, size: sz, pnl: 0, opened: ts(), simulated: true }];
               });
-            } else if (sigs[a] === "BASIS_TRADE") {
+            } else if (sig === "BASIS_TRADE") {
               setPositions(p => {
                 if (p.find(x => x.asset === a && x.type === "BASIS_TRADE")) return p;
                 const sz = rand(5000, 20000);
-                addLog("TRADE", `${a} BASIS_TRADE — spread ${fmtPct(bs[a], 2)}, size $${sz.toFixed(0)}`);
-                return [...p, { asset: a, type: "BASIS_TRADE", size: sz, pnl: 0, opened: ts() }];
+                addLog("TRADE", `[SIM] ${a} BASIS_TRADE — spread ${fmtPct(bs[a], 2)}, size $${sz.toFixed(0)}`);
+                return [...p, { asset: a, type: "BASIS_TRADE", size: sz, pnl: 0, opened: ts(), simulated: true }];
               });
             } else {
               setPositions(p => {
                 if (p.find(x => x.asset === a)) addLog("INFO", `${a}: parking capital — below all thresholds`);
                 return p.filter(x => x.asset !== a);
               });
-              // Deploy to lending when parking capital
-              const lendingAmount = VAULT_INITIAL / 2; // Split between BTC and ETH
+              const lendingAmount = VAULT_INITIAL / 2;
               setLending(prev => ({
                 ...prev,
                 [a]: { amount: lendingAmount, yield: prev[a].yield + rand(0.001, 0.005) }
@@ -615,11 +692,20 @@ export default function DeltaVault() {
       addLog("INFO", `Cycle #${tick + 1} — Drift + Pyth scanned`);
     }, 2500);
     return () => clearInterval(id);
-  }, [running, liveSync, addLog, tick]);
+  }, [running, liveSync, addLog, tick, crossChain.decisions, modeFromConfidence, riskLevelFromMetrics, vault.delta, vault.drawdown]);
 
   useEffect(() => {
     if (logsRef.current) logsRef.current.scrollTop = logsRef.current.scrollHeight;
   }, [logs]);
+
+  useEffect(() => {
+    if (!aiAgent.lastDecision) return;
+    if (lastAiDecisionRef.current === aiAgent.lastDecision) return;
+    lastAiDecisionRef.current = aiAgent.lastDecision;
+    setAiDecisionPulse(true);
+    const id = setTimeout(() => setAiDecisionPulse(false), 900);
+    return () => clearTimeout(id);
+  }, [aiAgent.lastDecision]);
 
   // ── Computed ──────────────────────────────────────────────────────────────
   const totalFundingYield = positions.filter(p => p.type === "DELTA_NEUTRAL").reduce((s, p) => s + p.size * funding[p.asset] * 24, 0);
@@ -628,6 +714,15 @@ export default function DeltaVault() {
   const lendingPercentage = totalLendingAmount / VAULT_INITIAL;
   const avgCrossEdge = (ASSETS.reduce((s, a) => s + (crossChain.decisions[a]?.netEdge ?? 0), 0) / ASSETS.length);
   const crossExecCount = ASSETS.filter(a => crossChain.decisions[a]?.execute).length;
+  const aiModeColor =
+    aiAgent.mode === "Aggressive" ? "#34d399" :
+    aiAgent.mode === "Conservative" ? "#f59e0b" :
+    "#38bdf8";
+  const aiRiskColor =
+    aiAgent.riskLevel === "High" ? "#f87171" :
+    aiAgent.riskLevel === "Medium" ? "#fbbf24" :
+    "#34d399";
+  const aiAccent = aiAgent.riskLevel === "High" ? aiRiskColor : aiModeColor;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // RENDER
@@ -644,6 +739,7 @@ export default function DeltaVault() {
         @keyframes blink{50%{opacity:0}}
         .pulse{animation:pulse 2.5s ease-in-out infinite}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+        @keyframes aiDecisionPulse{0%{opacity:.95;transform:scaleY(1)}60%{opacity:.5;transform:scaleY(1.02)}100%{opacity:.72;transform:scaleY(1)}}
         .fadein{animation:fadein .4s ease}
         @keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
         .hov:hover{background:#0f1520!important;transition:background .15s}
@@ -879,8 +975,81 @@ export default function DeltaVault() {
             </Card>
           </div>
 
-          {/* Second row */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
+          {/* ④ AI Agent spotlight row */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10, marginBottom: 10 }}>
+
+            {/* ④ AI Agent */}
+            <Card style={{ border: `1px solid ${aiAccent}33`, position: "relative", overflow: "hidden" }}>
+              <div
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: 3,
+                  background: aiAccent,
+                  opacity: aiDecisionPulse ? 0.95 : 0.72,
+                  boxShadow: `0 0 12px ${aiAccent}88`,
+                  animation: aiDecisionPulse ? "aiDecisionPulse 900ms ease-out" : "none",
+                  transformOrigin: "center",
+                }}
+              />
+              <SectionHead n="4" label="AI AGENT" color={aiAccent} />
+
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: -4, marginBottom: 10 }}>
+                <span style={{ fontSize: 7, color: "#2a3a4e", letterSpacing: 1.3 }}>Status</span>
+                <span style={{
+                  fontSize: 7.5,
+                  fontWeight: 600,
+                  letterSpacing: 1,
+                  padding: "2px 7px",
+                  borderRadius: 4,
+                  background: `${aiAccent}1f`,
+                  color: aiAccent,
+                  border: `1px solid ${aiAccent}44`,
+                }}>
+                  {aiAgent.enabled ? "ACTIVE" : "DISABLED"}
+                </span>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: 10 }}>
+                <div style={{ padding: "9px 10px", background: "#060911", borderRadius: 7, border: "1px solid #111e2e" }}>
+                  <div style={{ fontSize: 7, color: "#1e2e3e", letterSpacing: 1 }}>MODE</div>
+                  <div style={{ fontSize: 11, color: aiModeColor, marginTop: 4, fontWeight: 500 }}>{aiAgent.mode}</div>
+                </div>
+                <div style={{ padding: "9px 10px", background: "#060911", borderRadius: 7, border: "1px solid #111e2e" }}>
+                  <div style={{ fontSize: 7, color: "#1e2e3e", letterSpacing: 1 }}>CONFIDENCE</div>
+                  <div style={{ fontSize: 11, color: aiModeColor, marginTop: 4, fontWeight: 500 }}>{(aiAgent.confidence * 100).toFixed(1)}%</div>
+                </div>
+              </div>
+
+              <div style={{ padding: "10px 12px", background: "#060911", borderRadius: 8, border: "1px solid #111e2e", marginBottom: 8 }}>
+                <div style={{ fontSize: 7.5, color: aiAccent, letterSpacing: 1.5, marginBottom: 7 }}>LAST DECISION</div>
+                <div style={{ fontSize: 11, color: "#e8eef8", marginBottom: 4 }}>{aiAgent.lastDecision}</div>
+                <div style={{ fontSize: 8, color: "#3a4e62" }}>{aiAgent.reason}</div>
+              </div>
+
+              <div style={{ padding: "10px 12px", background: "#060911", borderRadius: 8, border: "1px solid #111e2e" }}>
+                <div style={{ fontSize: 7.5, color: aiAccent, letterSpacing: 1.5, marginBottom: 7 }}>SIGNALS</div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, marginBottom: 5 }}>
+                  <span style={{ color: "#2a3a4e" }}>Funding</span>
+                  <span style={{ color: aiModeColor }}>{aiAgent.fundingSummary}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, marginBottom: 5 }}>
+                  <span style={{ color: "#2a3a4e" }}>Cross-chain</span>
+                  <span style={{ color: aiAgent.crossChainSignal ? "#34d399" : "#f59e0b" }}>{aiAgent.crossChainSignal ? "ON" : "OFF"}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8 }}>
+                  <span style={{ color: "#2a3a4e" }}>Risk</span>
+                  <span style={{ color: aiRiskColor }}>{aiAgent.riskLevel}</span>
+                </div>
+              </div>
+            </Card>
+
+          </div>
+
+          {/* Engine cards row */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 10, marginBottom: 10 }}>
 
             {/* ③ Execution */}
             <Card>
@@ -927,11 +1096,12 @@ export default function DeltaVault() {
               {positions.length === 0
                 ? <div style={{ color: "#1a2535", fontSize: 10, padding: "10px 0", textAlign: "center" }}>No open positions · start bot to trade</div>
                 : positions.map((p, i) => (
-                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 10px", background: "#060911", borderRadius: 7, border: "1px solid #111e2e", marginBottom: 5 }}>
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 10px", background: "#060911", borderRadius: 7, border: `1px solid ${p.simulated ? "#2d1f00" : "#111e2e"}`, marginBottom: 5 }}>
                     <div>
                       <div style={{ display: "flex", gap: 7, alignItems: "center" }}>
                         <span style={{ fontSize: 12, fontWeight: 500, color: "#e8eef8" }}>{p.asset}</span>
                         <Pill label={p.type} />
+                        {p.simulated && <span style={{ fontSize: 7, background: "#2d1800", color: "#f59e0b", borderRadius: 3, padding: "1px 4px", letterSpacing: 1 }}>SIM</span>}
                       </div>
                       <div style={{ fontSize: 8, color: "#2a3a4e", marginTop: 3 }}>
                         Notional {fmtUSD(p.size)} · Opened {p.opened}

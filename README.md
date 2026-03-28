@@ -85,6 +85,33 @@ The bot serves a real-time JSON state endpoint at `http://localhost:3001`. The d
 - Capital manager state (reserved, lent, carryover)
 - Cross-chain decisions and funding map
 
+### 🤖 Adaptive AI Agent + Execution Guardrails
+The bot now includes a lightweight adaptive AI agent module that observes funding conditions and gates per-cycle execution:
+
+- Picks a preferred asset (or skips) based on live observation + rolling performance
+- Applies dynamic max-size caps from confidence/win-rate/volatility
+- Emits structured `[AI AGENT]` logs each cycle (observation, decision, state)
+- Exposes agent state over the bot API for dashboard rendering (mode, confidence, reason)
+
+To disable it quickly for testing, set `AI_AGENT_ENABLED=false` in `.env`.
+
+### 🔁 Reverse Delta-Neutral (Negative Funding)
+Delta-neutral execution is now explicitly two-way and regime-aware:
+
+- Positive funding: **LONG spot + SHORT perp**
+- Negative funding: **SHORT spot + LONG perp**
+- Exit logic is direction-aware (uses effective funding, not raw sign)
+- Strong funding regime flips trigger close/reverse behavior instead of stale hold states
+- Close signals now actually clear legs and reset strategy state so re-entry can happen cleanly
+
+### 🖥️ Dashboard Consistency Updates
+Recent dashboard behavior updates reduce live/sim confusion:
+
+- Vault PnL history now appends from live bot data during API sync
+- Simulation mode supports reverse delta-neutral signals (negative funding path)
+- Simulated positions are visibly tagged with `SIM` so they are distinguishable from live bot positions
+- The AI agent panel is shown as a dedicated spotlight row with live decision + risk context
+
 ### 🛡️ Improved Risk Engine
 | Improvement | Detail |
 |-------------|--------|
@@ -167,6 +194,29 @@ npm install
 cp .env.example .env
 # Edit .env with your Helius API key and wallet keypair
 npm run dev
+```
+
+### 3. Enable Secret-Scan Hook (Recommended)
+
+This repo includes a pre-commit hook at `.githooks/pre-commit` that blocks common secret leaks (`.env`, `keypair.json`, private keys, tokens).
+
+Run once after clone:
+
+```bash
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-commit
+```
+
+Validate manually:
+
+```bash
+.githooks/pre-commit
+```
+
+Emergency bypass (not recommended):
+
+```bash
+SKIP_SECRET_SCAN=1 git commit -m "..."
 ```
 
 ### Prerequisites
