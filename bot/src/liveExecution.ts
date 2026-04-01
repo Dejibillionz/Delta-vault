@@ -316,34 +316,35 @@ export class LiveExecutionEngine {
     try {
       const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
 
-      // For spot orders, marketIndex should be the FROM token (what we're spending/selling)
-      const fromMarketIndex = SPOT_MARKET[from as keyof typeof SPOT_MARKET].index;
-      const fromDecimals = DECIMALS[from];
+      // For spot swap orders, use the TO token's market index (what we're trading FOR)
+      const toMarketIndex = SPOT_MARKET[to as keyof typeof SPOT_MARKET].index;
+      const toDecimals = DECIMALS[to];
 
-      // Calculate amount of FROM token in base units
-      // usdAmount is always in USD, so for USDC it's direct
-      // For BTC/ETH we need to convert from USD to token quantity
-      let fromAmountRaw: number;
+      // Calculate how much of the TO token we want
+      let toAmountRaw: number;
 
-      if (from === "USDC") {
-        // USDC: $30 = 30 * 10^6 base units (USDC has 6 decimals)
-        fromAmountRaw = Math.floor(usdAmount * Math.pow(10, fromDecimals));
+      if (to === "USDC") {
+        // Buying USDC: amount is directly in USD terms
+        toAmountRaw = Math.floor(usdAmount * Math.pow(10, toDecimals));
       } else {
-        // For BTC/ETH: get current price and convert USD to token quantity
-        const markPrice = from === "BTC"
+        // Buying BTC/ETH: get current price and convert USD to token quantity
+        const markPrice = to === "BTC"
           ? convertToNumber(this.driftClient.getPerpMarketAccount(1)!.amm.lastMarkPriceTwap, PRICE_PRECISION)
           : convertToNumber(this.driftClient.getPerpMarketAccount(2)!.amm.lastMarkPriceTwap, PRICE_PRECISION);
 
         const tokenQuantity = usdAmount / markPrice;
-        fromAmountRaw = Math.floor(tokenQuantity * Math.pow(10, fromDecimals));
+        toAmountRaw = Math.floor(tokenQuantity * Math.pow(10, toDecimals));
       }
 
-      const baseAmountBN = new BN(fromAmountRaw);
+      const baseAmountBN = new BN(toAmountRaw);
 
-      // Use getMarketOrderParams with the FROM token's market index
+      // Direction: LONG if buying (from=USDC), SHORT if selling (to=USDC)
+      const direction = from === "USDC" ? PositionDirection.LONG : PositionDirection.SHORT;
+
+      // Use getMarketOrderParams with the TO token's market index
       const orderParams = getMarketOrderParams({
-        marketIndex: fromMarketIndex,
-        direction: side === "BUY" ? PositionDirection.LONG : PositionDirection.SHORT,
+        marketIndex: toMarketIndex,
+        direction,
         baseAssetAmount: baseAmountBN,
         marketType: MarketType.SPOT,
         reduceOnly: false,
