@@ -417,7 +417,9 @@ async function main() {
       let executionData: any = { executedTrade: false, events: [] as string[] };
       let riskData: any = {};
       let lendingData: any = { deployed: 0, yieldEarned: 0, byAsset: { BTC: { amount: 0, yield: 0 }, ETH: { amount: 0, yield: 0 } } };
-      let pnl = simulatedPnl;
+      // Calculate real PnL from open positions + lending yield
+      const openPositionsPnL = Array.from(positions.values()).reduce((sum, pos) => sum + (pos.unrealizedPnl ?? 0), 0);
+      let pnl = openPositionsPnL + (lendingData.yieldEarned ?? 0);
       let mode = "BALANCED";
       const totalCapital = vaultEquity;
       const capitalState = { availableCapital: totalCapital };
@@ -480,8 +482,61 @@ async function main() {
           continue;
         }
 
-        // Signal
-        const signal = strategyEngine.evaluate(snap);
+        // ─── CHECK FOR POSITION EXITS ───────────────────────────────────────
+        // Before evaluating new signals, check if open positions should be closed
+        const currentState = strategyEngine.getState()[asset];
+        let signal = strategyEngine.evaluate(snap); // default signal
+
+        if (currentState === "DELTA_NEUTRAL" || currentState === "BASIS_TRADE") {
+          // Update position's realized/unrealized PnL
+          execEngine.updatePositionPnL(asset, snap.fundingRate);
+
+          // Get entry funding rate from strategy engine
+          const fundingExitEval = strategyEngine.shouldExitFundingBased(asset, snap.fundingRate);
+          if (fundingExitEval.shouldClose) {
+            logger.info(`${asset}: Position exit triggered — ${fundingExitEval.reason}`);
+            signal = {
+              asset,
+              signal: currentState === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL_CLOSE" : "BASIS_TRADE_CLOSE",
+              reason: fundingExitEval.reason,
+              urgency: "HIGH",
+              suggestedSizeUSD: 0,
+              metadata: {
+                fundingRate: snap.fundingRate,
+                basisSpread: snap.basisSpread,
+                spotPrice: snap.spotPrice,
+                perpPrice: snap.perpPrice,
+                liquidityScore: snap.liquidityScore,
+              },
+            };
+          }
+
+          // Also check time-based and profit-taking exits via execution engine
+          if (!fundingExitEval.shouldClose) {
+            const openPositions = execEngine.getOpenPositions();
+            const pos = openPositions.get(asset);
+            const entryFundingRate = pos?.entryFundingRate ?? snap.fundingRate;
+
+            const timeExitEval = execEngine.evaluatePositionExit(asset, snap.fundingRate, entryFundingRate);
+            if (timeExitEval.shouldClose) {
+              logger.info(`${asset}: Position exit triggered — ${timeExitEval.reason}`);
+              signal = {
+                asset,
+                signal: currentState === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL_CLOSE" : "BASIS_TRADE_CLOSE",
+                reason: timeExitEval.reason,
+                urgency: "MEDIUM",
+                suggestedSizeUSD: 0,
+                metadata: {
+                  fundingRate: snap.fundingRate,
+                  basisSpread: snap.basisSpread,
+                  spotPrice: snap.spotPrice,
+                  perpPrice: snap.perpPrice,
+                  liquidityScore: snap.liquidityScore,
+                },
+              };
+            }
+          }
+        }
 
         const fundingRate = snap.fundingRate;
         const basis = snap.basisSpread;
@@ -697,7 +752,8 @@ async function main() {
         solanaLatencyMs: 100,
         oracleStalenessS: 0,
       };
-      const currentMetrics = riskEngine.assess(nav, vaultEquity * 0.8, Array.from(positions.values()), currentConditions);
+      // Use actual vault equity for risk assessment, not simulated PnL
+      const currentMetrics = riskEngine.assess(vaultEquity, vaultEquity * 0.8, Array.from(positions.values()), currentConditions);
       const deltaExposure = currentMetrics.deltaExposurePct;
 
       botState.timestamp = Date.now();
@@ -853,14 +909,15 @@ async function main() {
       console.log(`\n${chalk.cyan('[SUMMARY]')}`);
       console.log(`PnL: +$${pnl.toFixed(2)} | Mode: ${mode}`);
 
-      // Simulate profit accumulation for demo
-      simulatedPnl += Math.random() * 5;
+      // Calculate real PnL from open positions (not simulated)
+      const realizedPnL = Array.from(positions.values()).reduce((sum, pos) => sum + (pos.unrealizedPnl ?? 0), 0);
+      const totalRealPnL = realizedPnL + (lendingData.yieldEarned ?? 0);
 
       // Telegram cycle summary (every 10 cycles)
       await telegram.cycleUpdate({
         tick,
         nav:       vaultEquity,
-        pnl:       simulatedPnl,
+        pnl:       totalRealPnL,
         positions: positions.size,
         btcSignal: currentStrategies.BTC ?? "—",
         ethSignal: currentStrategies.ETH ?? "—",

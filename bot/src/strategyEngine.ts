@@ -71,6 +71,9 @@ export class StrategyEngine {
   // -1 = entered on negative funding (short spot / long perp)
   private fundingDir: Record<"BTC" | "ETH", 1 | -1> = { BTC: 1, ETH: 1 };
 
+  // Store entry funding rates for comparison with current rates
+  private entryFundingRate: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
+
   constructor(logger: Logger) {
     this.logger = logger;
   }
@@ -85,6 +88,37 @@ export class StrategyEngine {
 
   setState(asset: "BTC" | "ETH", val: ActiveState["BTC"]): void {
     this.state[asset] = val;
+  }
+
+  /**
+   * Check if current funding rate warrants closing an open position
+   * Used by LiveExecutionEngine.evaluatePositionExit() for detailed checks
+   */
+  shouldExitFundingBased(
+    asset: "BTC" | "ETH",
+    currentFundingRate: number
+  ): { shouldClose: boolean; reason: string } {
+    const dir = this.fundingDir[asset];
+    const entryFR = this.entryFundingRate[asset];
+    const effectiveFunding = currentFundingRate * dir;
+
+    // Regime flipped
+    if ((entryFR >= 0 && currentFundingRate < 0) || (entryFR < 0 && currentFundingRate >= 0)) {
+      return {
+        shouldClose: true,
+        reason: `Regime flipped: entry=${pct(entryFR)} → current=${pct(currentFundingRate)}`,
+      };
+    }
+
+    // Dropped below threshold
+    if (effectiveFunding < THRESHOLDS.FUNDING_RATE_EXIT) {
+      return {
+        shouldClose: true,
+        reason: `Effective funding ${pct(effectiveFunding)} below exit threshold ${pct(THRESHOLDS.FUNDING_RATE_EXIT)}`,
+      };
+    }
+
+    return { shouldClose: false, reason: "Funding still favorable" };
   }
 
   // ─── Evaluate market snapshot → emit signal ──────────────────────────────
@@ -139,6 +173,7 @@ export class StrategyEngine {
         liquidityScore >= THRESHOLDS.MIN_LIQUIDITY_SCORE
       ) {
         this.fundingDir[asset as "BTC" | "ETH"] = fundingRate >= 0 ? 1 : -1;
+        this.entryFundingRate[asset as "BTC" | "ETH"] = fundingRate;
         const size = this.sizeDeltaNeutral(fundingRate, maxSize);
         const fundingDirection = fundingRate >= 0 ? "positive" : "negative";
         this.logger.trade(

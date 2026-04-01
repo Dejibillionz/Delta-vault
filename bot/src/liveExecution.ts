@@ -290,7 +290,33 @@ export class LiveExecutionEngine {
 
     try {
       const mi = PERP_MARKET[asset].index;
-      const txSig = await this.driftClient.closePosition(mi, MarketType.PERP);
+      const market = this.driftClient.getPerpMarketAccount(mi);
+      if (!market) throw new Error(`No market data for ${asset}`);
+
+      // Get current position to determine close direction
+      const user = this.driftClient.getUser();
+      const pos = user.getPerpPosition(mi);
+
+      if (!pos || pos.baseAssetAmount === 0) {
+        record.status = "FILLED";
+        record.error = "No open position";
+        this.logger.trade(`Drift CLOSE ${asset}: no open position`);
+        return record;
+      }
+
+      // Close by placing opposite order with reduceOnly
+      const closeDirection = pos.baseAssetAmount > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
+      const closeAmount = new BN(Math.abs(pos.baseAssetAmount));
+
+      const orderParams = getMarketOrderParams({
+        marketIndex: mi,
+        direction: closeDirection,
+        baseAssetAmount: closeAmount,
+        marketType: MarketType.PERP,
+        reduceOnly: true,
+      });
+
+      const txSig = await this.driftClient.placePerpOrder(orderParams);
       await this.connection.confirmTransaction(txSig, "confirmed");
       record.txSig = txSig;
       record.status = "FILLED";
@@ -336,6 +362,88 @@ export class LiveExecutionEngine {
 
     this.orderLog.push(record);
     return record;
+  }
+
+  // ─── Position Exit Evaluation ──────────────────────────────────────────
+  /**
+   * Evaluate if a position should be closed based on:
+   * 1. Time-based: max hold time exceeded
+   * 2. Profit-taking: target profit reached
+   * 3. Min funding: effective rate drops below minimum
+   */
+  evaluatePositionExit(
+    asset: Asset,
+    currentFundingRate: number,
+    entryFundingRate: number
+  ): { shouldClose: boolean; reason: string } {
+    const pos = this.openPositions.get(asset);
+    if (!pos) return { shouldClose: false, reason: "No position" };
+
+    const ageMs = Date.now() - pos.openedAt;
+    const ageHours = ageMs / (1000 * 60 * 60);
+
+    // 1. Max hold time: 4 hours (prevents position from running too long)
+    if (ageHours > 4) {
+      return { shouldClose: true, reason: `Position held for ${ageHours.toFixed(1)}h (max 4h)` };
+    }
+
+    // 2. Profit-taking: close after 1% profit on notional
+    if (pos.unrealizedPnl > pos.perpNotional * 0.01) {
+      return {
+        shouldClose: true,
+        reason: `Profit target hit: PnL $${pos.unrealizedPnl.toFixed(2)} (1% of $${pos.perpNotional.toFixed(0)})`,
+      };
+    }
+
+    // 3. Funding regime flipped: effective funding reversed
+    const entryDir = entryFundingRate >= 0 ? 1 : -1;
+    const currentDir = currentFundingRate >= 0 ? 1 : -1;
+    if (entryDir !== currentDir) {
+      return {
+        shouldClose: true,
+        reason: `Funding regime flipped: entry=${pct(entryFundingRate)} vs current=${pct(currentFundingRate)}`,
+      };
+    }
+
+    // 4. Effective funding dropped below minimum threshold (0.005% per hour)
+    const effectiveFunding = currentFundingRate * entryDir;
+    const MIN_FUNDING_EXIT = 0.00005;
+    if (effectiveFunding < MIN_FUNDING_EXIT && ageHours > 0.5) {
+      return {
+        shouldClose: true,
+        reason: `Effective funding ${pct(effectiveFunding)} below minimum (0.005%), held ${ageHours.toFixed(1)}h`,
+      };
+    }
+
+    // 5. Funding urgency: close if we're only holding another 5 min of funding
+    const estimatedNextFunding = currentFundingRate / 8; // hourly / 8 = per 7.5min
+    const nextCycleReturn = pos.perpNotional * estimatedNextFunding;
+    if (ageHours > 0.25 && nextCycleReturn < 0.5) {
+      // Less than $0.50 funding next cycle
+      return {
+        shouldClose: true,
+        reason: `Funding depleted: next cycle return only $${nextCycleReturn.toFixed(2)}`,
+      };
+    }
+
+    return { shouldClose: false, reason: "Position conditions favorable" };
+  }
+
+  /**
+   * Update position's unrealized PnL based on current market conditions
+   */
+  updatePositionPnL(asset: Asset, fundingRate: number): void {
+    const pos = this.openPositions.get(asset);
+    if (!pos) return;
+
+    const ageMs = Date.now() - pos.openedAt;
+    const ageHours = ageMs / (1000 * 60 * 60);
+
+    // Funding collected = position notional × funding rate × hours held
+    pos.fundingCollected = pos.perpNotional * fundingRate * ageHours;
+
+    // Set unrealizedPnl to funding collected (delta-neutral has no directional PnL)
+    pos.unrealizedPnl = pos.fundingCollected;
   }
 
   // ─── Getters ─────────────────────────────────────────────────────────────
