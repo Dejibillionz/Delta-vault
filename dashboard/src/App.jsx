@@ -10,7 +10,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 const ASSETS = ["BTC", "ETH"];
 const FUNDING_THRESHOLD = 0.0001;   // 0.01%/hr
 const BASIS_THRESHOLD   = 0.01;     // 1%
-const VAULT_INITIAL     = 250000;
+const VAULT_INITIAL     = 0; // Will be populated from bot API; fallback for sim mode
 const CROSS_CHAIN_CHAINS = ["solana", "arbitrum", "base", "optimism", "polygon", "avalanche", "bnb"];
 
 const CROSS_CHAIN_CFG = {
@@ -315,7 +315,7 @@ export default function DeltaVault() {
   const [aiDecisionPulse, setAiDecisionPulse] = useState(false);
 
   // Vault metrics
-  const [vault, setVault] = useState({ nav: VAULT_INITIAL, pnl: 0, drawdown: 0, delta: 0, hwm: VAULT_INITIAL });
+  const [vault, setVault] = useState({ nav: 0, pnl: 0, drawdown: 0, delta: 0, hwm: 0 });
 
   // History arrays
   const [hPnl,  setHPnl]  = useState(Array(50).fill(0));
@@ -1057,10 +1057,10 @@ export default function DeltaVault() {
               {/* Protocol stack */}
               <div style={{ display: "flex", gap: 7, marginBottom: 12 }}>
                 {[
-                  { l: "PERP EXCHANGE", v: "Drift Protocol v2", c: "#f59e0b", sub: "Solana mainnet" },
-                  { l: "SPOT ROUTING",  v: "Jupiter Aggregator", c: "#00ffa3", sub: "v6 API" },
+                  { l: "PERP EXCHANGE", v: "Drift Protocol v2", c: "#f59e0b", sub: "placePerpOrder()" },
+                  { l: "SPOT ROUTING",  v: "Jupiter Aggregator", c: "#00ffa3", sub: "HTTP API swap" },
                   { l: "RPC PROVIDER",  v: "Helius",             c: "#5ba8d0", sub: "WebSocket + REST" },
-                  { l: "WALLET",        v: wallet.connected ? shortAddr(wallet.address) : "Phantom", c: "#a78bfa", sub: wallet.connected ? "Connected" : "Not connected" },
+                  { l: "POSITION CLOSE", v: "reduceOnly order",  c: "#f87171", sub: "Drift perp + Jupiter reverse" },
                 ].map(t => (
                   <div key={t.l} style={{ flex: 1, padding: "8px 9px", background: "#060911", borderRadius: 7, border: `1px solid ${t.c}18` }}>
                     <div style={{ fontSize: 7, color: "#1e2e3e", letterSpacing: 1, marginBottom: 4 }}>{t.l}</div>
@@ -1348,7 +1348,7 @@ export default function DeltaVault() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                 {[
                   { icon: "②", title: "Strategy Engine", col: "#5ba8d0", items: ["Evaluates funding rate vs 0.01%/hr threshold", "Evaluates basis spread vs 1.0% threshold", "Kelly-inspired position sizing by signal strength", "Emits typed signals: DELTA_NEUTRAL / BASIS_TRADE / PARK_CAPITAL"] },
-                  { icon: "④", title: "Risk Engine",      col: "#f87171", items: ["10s check cycle (faster than 30s strategy loop)", "Hard stop: drawdown > 10% → close all", "Rebalance trigger: delta exposure > 5% of NAV", "Single leg stop: position loss > 7%", "Collateral guard: free collateral < 20% → halt entries"] },
+                  { icon: "④", title: "Risk Engine",      col: "#f87171", items: ["10s check cycle (faster than 30s strategy loop)", "Hard stop: drawdown > 10% → close all (uses actual Drift equity)", "Rebalance trigger: delta exposure > 5% of NAV", "Position auto-close: max 4hr hold / 1% profit target / funding flip", "Duplicate guard: prevents opening multiple positions per asset"] },
                 ].map(c => (
                   <Card key={c.title} style={{ border: `1px solid ${c.col}22` }}>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
@@ -1373,9 +1373,9 @@ export default function DeltaVault() {
               <div style={{ fontSize: 8, color: "#2a3a4e", letterSpacing: 2, marginBottom: 8, textAlign: "center" }}>EXECUTION LAYER</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
                 {[
-                  { icon: "③", title: "Drift Protocol", col: "#f59e0b", desc: "Solana perp DEX. Places PERP SHORT via placePerpOrder(). Closes via closePosition(). Rebalances on delta breach." },
-                  { icon: "◑", title: "Jupiter v6",      col: "#00ffa3", desc: "Best-route spot swaps. USDC → BTC/ETH for spot long leg. Price impact checked < 0.5% before execution." },
-                  { icon: "⬡", title: "Phantom / Vault Keypair", col: "#a78bfa", desc: "Browser: Phantom wallet for manual approvals. Server: secure keypair from env var. Signs all transactions." },
+                  { icon: "③", title: "Drift Protocol", col: "#f59e0b", desc: "Solana perp DEX. Opens via placePerpOrder(). Closes via reduceOnly market order. Collects funding rate yield on short positions." },
+                  { icon: "◑", title: "Jupiter API",      col: "#00ffa3", desc: "HTTP API spot swaps. USDC → BTC/ETH for spot long leg. No minimum order size — works with any vault size. Price impact checked before execution." },
+                  { icon: "⬡", title: "Phantom / Vault Keypair", col: "#a78bfa", desc: "Browser: Phantom wallet for manual approvals. Server: keypair extending Drift SDK Wallet class. Signs all transactions." },
                 ].map(c => (
                   <Card key={c.title} style={{ border: `1px solid ${c.col}22` }}>
                     <div style={{ fontSize: 16, color: c.col, marginBottom: 7 }}>{c.icon}</div>
@@ -1434,7 +1434,7 @@ export default function DeltaVault() {
             {[
               { n: "01", title: "Scan", col: "#34d399", desc: "Every 30s, the Market Data Engine polls Pyth for live BTC/ETH prices and reads Drift's AMM for hourly funding rates and basis spreads." },
               { n: "02", title: "Decide", col: "#5ba8d0", desc: "The Strategy Engine applies thresholds. If funding > 0.01%/hr, a delta-neutral trade is worthwhile. If basis > 1%, a basis convergence trade fires." },
-              { n: "03", title: "Execute", col: "#f59e0b", desc: "Both legs placed atomically. Spot LONG via Jupiter swap, perp SHORT via Drift placePerpOrder(). If either leg fails, the other is automatically unwound." },
+              { n: "03", title: "Execute", col: "#f59e0b", desc: "Both legs placed sequentially. Spot LONG via Jupiter API swap, perp SHORT via Drift placePerpOrder(). If the spot leg fails, the perp order is never sent. Positions close via reduceOnly orders." },
             ].map(s => (
               <Card key={s.n} style={{ border: `1px solid ${s.col}22` }}>
                 <div style={{ fontSize: 28, fontWeight: 800, color: s.col + "33", fontFamily: "'Syne',sans-serif", marginBottom: 6 }}>{s.n}</div>
