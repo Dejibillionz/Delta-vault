@@ -52,6 +52,7 @@ export interface OrderRecord {
   leg: "SPOT" | "PERP";
   side: "BUY" | "SELL" | "SHORT" | "CLOSE";
   notionalUSD: number;
+  baseQuantity?: number;  // actual token quantity (e.g. 0.000438 BTC)
   txSig?: string;
   status: "PENDING" | "FILLED" | "FAILED";
   error?: string;
@@ -141,13 +142,20 @@ export class LiveExecutionEngine {
       return null;
     }
     position.spotNotional = amount;
+
+    // Extract the actual base quantity from the spot fill for quantity-matched perp sizing
+    const spotBaseQty = spotLeg.baseQuantity;
+    if (spotBaseQty) {
+      this.logger.info(`${asset}: Spot fill qty=${spotBaseQty.toFixed(8)} — will match perp to same quantity`);
+    }
     this.logger.trade(`${asset}: Spot leg FILLED — tx: ${spotLeg.txSig}`);
 
 
     // ── LEG 2: Perp leg via Drift ───────────────────────────────────────
+    // Pass spotBaseQty so Drift shorts/longs the EXACT same quantity as the spot fill
     const perpResult = side === "short-perp"
-      ? await this.driftPerpShort(asset, amount)
-      : await this.driftPerpLong(asset, amount);
+      ? await this.driftPerpShort(asset, amount, spotBaseQty)
+      : await this.driftPerpLong(asset, amount, spotBaseQty);
     position.legs.push(perpResult);
 
     if (perpResult.status === "FAILED") {
@@ -194,7 +202,8 @@ export class LiveExecutionEngine {
   }
 
   // ─── DRIFT: Place perp short order ──────────────────────────────────────
-  private async driftPerpShort(asset: Asset, usdNotional: number): Promise<OrderRecord> {
+  // When exactBaseQty is provided (from spot fill), use it directly for quantity matching
+  private async driftPerpShort(asset: Asset, usdNotional: number, exactBaseQty?: number): Promise<OrderRecord> {
     const record = this.newRecord(asset, "PERP", "SHORT", usdNotional);
 
     try {
@@ -203,7 +212,9 @@ export class LiveExecutionEngine {
       if (!market) throw new Error(`No market data for ${asset}`);
 
       const markPrice = convertToNumber(market.amm.lastMarkPriceTwap, PRICE_PRECISION);
-      const baseAmount = usdNotional / markPrice;
+
+      // Use exact spot quantity if available, otherwise fall back to USD / markPrice
+      const baseAmount = exactBaseQty ?? (usdNotional / markPrice);
       const minSize = PERP_MARKET[asset].minOrderSize;
 
       if (baseAmount < minSize) {
@@ -229,7 +240,13 @@ export class LiveExecutionEngine {
       record.txSig = txSig;
       record.status = "FILLED";
       record.fillPrice = markPrice;
-      this.logger.trade(`Drift SHORT ${asset} | size=${baseAmount.toFixed(6)} | price=${usd(markPrice)} | tx=${txSig}`);
+      record.baseQuantity = baseAmount;
+
+      if (exactBaseQty) {
+        this.logger.trade(`Drift SHORT ${asset} | qty=${baseAmount.toFixed(8)} (matched to spot) | driftPrice=${usd(markPrice)} | tx=${txSig}`);
+      } else {
+        this.logger.trade(`Drift SHORT ${asset} | qty=${baseAmount.toFixed(6)} | price=${usd(markPrice)} | tx=${txSig}`);
+      }
     } catch (err: any) {
       record.status = "FAILED";
       record.error = err.message;
@@ -241,7 +258,8 @@ export class LiveExecutionEngine {
   }
 
   // ─── DRIFT: Place perp long order ───────────────────────────────────────
-  private async driftPerpLong(asset: Asset, usdNotional: number): Promise<OrderRecord> {
+  // When exactBaseQty is provided (from spot fill), use it directly for quantity matching
+  private async driftPerpLong(asset: Asset, usdNotional: number, exactBaseQty?: number): Promise<OrderRecord> {
     const record = this.newRecord(asset, "PERP", "BUY", usdNotional);
 
     try {
@@ -250,7 +268,9 @@ export class LiveExecutionEngine {
       if (!market) throw new Error(`No market data for ${asset}`);
 
       const markPrice = convertToNumber(market.amm.lastMarkPriceTwap, PRICE_PRECISION);
-      const baseAmount = usdNotional / markPrice;
+
+      // Use exact spot quantity if available, otherwise fall back to USD / markPrice
+      const baseAmount = exactBaseQty ?? (usdNotional / markPrice);
       const minSize = PERP_MARKET[asset].minOrderSize;
 
       if (baseAmount < minSize) {
@@ -273,7 +293,13 @@ export class LiveExecutionEngine {
       record.txSig = txSig;
       record.status = "FILLED";
       record.fillPrice = markPrice;
-      this.logger.trade(`Drift LONG ${asset} | size=${baseAmount.toFixed(6)} | price=${usd(markPrice)} | tx=${txSig}`);
+      record.baseQuantity = baseAmount;
+
+      if (exactBaseQty) {
+        this.logger.trade(`Drift LONG ${asset} | qty=${baseAmount.toFixed(8)} (matched to spot) | driftPrice=${usd(markPrice)} | tx=${txSig}`);
+      } else {
+        this.logger.trade(`Drift LONG ${asset} | qty=${baseAmount.toFixed(6)} | price=${usd(markPrice)} | tx=${txSig}`);
+      }
     } catch (err: any) {
       record.status = "FAILED";
       record.error = err.message;
@@ -345,14 +371,22 @@ export class LiveExecutionEngine {
       // Execute swap via Jupiter
       const swapResult = await this.jupiterSwapper.swap(from, to, usdAmount);
 
+      // Calculate actual base quantity received
+      // outputAmount is in base units (e.g. satoshis for BTC = 8 decimals, lamports for USDC = 6)
+      const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
+      const toDecimals = DECIMALS[to];
+      const baseQuantity = swapResult.outputAmount / Math.pow(10, toDecimals);
+      const effectivePrice = usdAmount / baseQuantity;
+
       // Record successful swap
       record.txSig = swapResult.txSig;
       record.status = "FILLED";
       record.slippagePct = swapResult.slippagePct;
-      record.fillPrice = 1; // Price data from Jupiter would be needed for accuracy
+      record.fillPrice = effectivePrice;
+      record.baseQuantity = baseQuantity;
 
       this.logger.trade(
-        `Jupiter Spot ${from}→${to} | amount=$${usdAmount.toFixed(0)} | slippage=${record.slippagePct.toFixed(2)}% | tx=${swapResult.txSig}`
+        `Jupiter Spot ${from}→${to} | amount=$${usdAmount.toFixed(0)} | qty=${baseQuantity.toFixed(8)} | price=${usd(effectivePrice)} | slippage=${record.slippagePct.toFixed(2)}% | tx=${swapResult.txSig}`
       );
     } catch (err: any) {
       record.status = "FAILED";

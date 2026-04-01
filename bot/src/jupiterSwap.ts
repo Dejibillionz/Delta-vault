@@ -108,14 +108,25 @@ export class JupiterSwapper {
       };
     } catch (err: any) {
       if (err.message === "MOCK_SWAP_OFFLINE") {
-        // Devnet offline mode: simulate successful swap
+        // Devnet offline mode: simulate successful swap with price conversion
         const fakeTxSig = `MockTx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
         this.logger.info(`Jupiter offline mode: simulating ${from}→${to} swap with tx ${fakeTxSig}`);
 
+        const MOCK_PRICES: Record<string, number> = { USDC: 1, BTC: 68500, ETH: 2150 };
+        const fromPrice = MOCK_PRICES[from] ?? 1;
+        const toPrice = MOCK_PRICES[to] ?? 1;
+        const fromDecimals = from === "USDC" ? 6 : 8;
+        const toDecimals = to === "USDC" ? 6 : 8;
+
+        const inputAmount = Math.floor(amountUSD * Math.pow(10, fromDecimals));
+        const usdValue = amountUSD * fromPrice;
+        const outputTokens = usdValue / toPrice;
+        const outputAmount = Math.floor(outputTokens * 0.99 * Math.pow(10, toDecimals));
+
         return {
           txSig: fakeTxSig,
-          inputAmount: Math.floor(amountUSD * Math.pow(10, from === "USDC" ? 6 : 8)),
-          outputAmount: Math.floor(amountUSD * 0.99 * Math.pow(10, to === "USDC" ? 6 : 8)),
+          inputAmount,
+          outputAmount,
           slippagePct: 1.0,
         };
       }
@@ -173,8 +184,16 @@ export class JupiterSwapper {
       if (err.code === "ENOTFOUND" || err.message.includes("Network")) {
         this.logger.info(`Jupiter API unavailable, using mock quote for ${from}→${to}`);
 
-        // Mock: 1% slippage
-        const mockOutputAmount = Math.floor(inputAmount * 0.99);
+        // Mock: convert between tokens using approximate prices, then apply 1% slippage
+        const MOCK_PRICES: Record<string, number> = { USDC: 1, BTC: 68500, ETH: 2150 };
+        const fromPrice = MOCK_PRICES[from] ?? 1;
+        const toPrice = MOCK_PRICES[to] ?? 1;
+        const toDecimals = to === "USDC" ? 6 : 8;
+
+        // Convert input USD value to output token amount
+        const usdValue = inputAmount * fromPrice / Math.pow(10, decimals);
+        const outputTokens = usdValue / toPrice;
+        const mockOutputAmount = Math.floor(outputTokens * 0.99 * Math.pow(10, toDecimals)); // 1% slippage
 
         return {
           inputMint,
