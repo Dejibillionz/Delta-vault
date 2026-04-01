@@ -316,17 +316,33 @@ export class LiveExecutionEngine {
     try {
       const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
 
-      // Get market index for the token being bought/sold
-      const marketIndex = SPOT_MARKET[asset as keyof typeof SPOT_MARKET].index;
+      // For spot orders, marketIndex should be the FROM token (what we're spending/selling)
+      const fromMarketIndex = SPOT_MARKET[from as keyof typeof SPOT_MARKET].index;
+      const fromDecimals = DECIMALS[from];
 
-      // Calculate base asset amount
-      const decimals = DECIMALS[asset];
-      const baseAmount = usdAmount / Math.pow(10, decimals);
-      const baseAmountBN = new BN(Math.floor(baseAmount * BASE_PRECISION.toNumber()));
+      // Calculate amount of FROM token in base units
+      // usdAmount is always in USD, so for USDC it's direct
+      // For BTC/ETH we need to convert from USD to token quantity
+      let fromAmountRaw: number;
 
-      // Use getMarketOrderParams for proper order construction
+      if (from === "USDC") {
+        // USDC: $30 = 30 * 10^6 base units (USDC has 6 decimals)
+        fromAmountRaw = Math.floor(usdAmount * Math.pow(10, fromDecimals));
+      } else {
+        // For BTC/ETH: get current price and convert USD to token quantity
+        const markPrice = from === "BTC"
+          ? convertToNumber(this.driftClient.getPerpMarketAccount(1)!.amm.lastMarkPriceTwap, PRICE_PRECISION)
+          : convertToNumber(this.driftClient.getPerpMarketAccount(2)!.amm.lastMarkPriceTwap, PRICE_PRECISION);
+
+        const tokenQuantity = usdAmount / markPrice;
+        fromAmountRaw = Math.floor(tokenQuantity * Math.pow(10, fromDecimals));
+      }
+
+      const baseAmountBN = new BN(fromAmountRaw);
+
+      // Use getMarketOrderParams with the FROM token's market index
       const orderParams = getMarketOrderParams({
-        marketIndex,
+        marketIndex: fromMarketIndex,
         direction: side === "BUY" ? PositionDirection.LONG : PositionDirection.SHORT,
         baseAssetAmount: baseAmountBN,
         marketType: MarketType.SPOT,
