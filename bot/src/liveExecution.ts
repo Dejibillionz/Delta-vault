@@ -126,31 +126,17 @@ export class LiveExecutionEngine {
       legs: [],
     };
 
-    // ── LEG 1: Spot leg via Drift (only if amount >= $100 USDC minimum) ───────
-    // Drift spot markets have order_step_size >= 100M base units:
-    //   - USDC: 100M units = 100 USDC ✓ (feasible)
-    //   - BTC/ETH: 100M units = 1 BTC/ETH (~$68k+) ✗ (not feasible for small vaults)
-    // For now, skip spot and do perp-only if undersized
-    const DRIFT_SPOT_MIN_USD = 100;
-    if (amount >= DRIFT_SPOT_MIN_USD) {
-      const spotResult = side === "short-perp"
-        ? await this.driftSpotSwap("USDC", asset, amount)
-        : await this.driftSpotSwap(asset, "USDC", amount);
-      position.legs.push(spotResult);
+    // ── LEG 1: Spot leg via Drift (SKIP for now due to minimum order size constraints) ───
+    // Drift spot requires buying 1 full BTC (~$68k) or 1 full ETH (~$2.1k) as minimum.
+    // For small vaults, this is infeasible. Instead, pursue perp-only positions
+    // that still capture funding arbitrage without spot collateral requirements.
+    this.logger.info(
+      `${asset}: Skipping spot leg (Drift minimum is 1 ${asset} ≈ $${
+        asset === "BTC" ? "68000" : "2100"
+      }). Using perp-only for funding arbitrage.`
+    );
 
-      if (spotResult.status === "FAILED") {
-        this.logger.error(`${asset}: Spot leg failed — aborting. No perp order sent.`);
-        return null;
-      }
-      position.spotNotional = amount;
-      this.logger.trade(`${asset}: Spot leg FILLED — tx: ${spotResult.txSig}`);
-    } else {
-      // Skip spot leg if undersized; do perp-only
-      this.logger.warn(
-        `${asset}: Spot amount $${amount.toFixed(0)} < Drift minimum $${DRIFT_SPOT_MIN_USD}. ` +
-        `Using perp-only (no spot leg).`
-      );
-    }
+
 
     // ── LEG 2: Perp leg via Drift ───────────────────────────────────────
     const perpResult = side === "short-perp"
@@ -159,14 +145,7 @@ export class LiveExecutionEngine {
     position.legs.push(perpResult);
 
     if (perpResult.status === "FAILED") {
-      this.logger.error(`${asset}: Perp leg failed — unwinding spot leg`);
-      if (position.spotNotional > 0) {
-        if (side === "short-perp") {
-          await this.driftSpotSwap(asset, "USDC", position.spotNotional);
-        } else {
-          await this.driftSpotSwap("USDC", asset, position.spotNotional);
-        }
-      }
+      this.logger.error(`${asset}: Perp leg failed.`);
       return null;
     }
     position.perpNotional = amount;
@@ -188,11 +167,13 @@ export class LiveExecutionEngine {
     const perpClose = await this.driftClosePerp(asset);
     pos.legs.push(perpClose);
 
-    // Close spot leg based on opening side
-    const spotClose = pos.side === "short-perp"
-      ? await this.driftSpotSwap(asset, "USDC", pos.spotNotional)
-      : await this.driftSpotSwap("USDC", asset, pos.spotNotional);
-    pos.legs.push(spotClose);
+    // Close spot leg only if it was opened (spotNotional > 0)
+    if (pos.spotNotional > 0) {
+      const spotClose = pos.side === "short-perp"
+        ? await this.driftSpotSwap(asset, "USDC", pos.spotNotional)
+        : await this.driftSpotSwap("USDC", asset, pos.spotNotional);
+      pos.legs.push(spotClose);
+    }
 
     this.openPositions.delete(asset);
     this.logger.trade(`${asset}: Position closed. Final PnL: $${pos.unrealizedPnl.toFixed(2)}`);
