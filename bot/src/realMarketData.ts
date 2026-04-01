@@ -77,15 +77,10 @@ export class RealMarketDataEngine {
     this.logger = logger;
     this.network = network;
 
-    // Pyth HTTP client (Pythnet mainnet)
-   
-
-const pythProgramKey = getPythProgramKeyForCluster("mainnet-beta");
-
-this.pythClient = new PythHttpClient(
-  connection,
-  pythProgramKey
-);
+    // Pyth HTTP client — use the correct cluster based on network
+    const pythCluster = network === "mainnet-beta" ? "mainnet-beta" : "devnet";
+    const pythProgramKey = getPythProgramKeyForCluster(pythCluster as any);
+    this.pythClient = new PythHttpClient(connection, pythProgramKey);
   }
 
   async start(): Promise<void> {

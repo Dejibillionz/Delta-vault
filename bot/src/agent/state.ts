@@ -41,5 +41,10 @@ export function updateState(state: AgentState, feedback: TradeFeedback): void {
   }
 
   state.winRate = Math.max(0, Math.min(1, state.winRate));
-  state.confidence = Math.max(0, Math.min(1, 0.5 + (state.winRate - 0.5)));
+
+  // Confidence scales faster than winRate: amplify deviation from neutral
+  const wins = state.lastTrades.filter(t => t.pnl > 0).length;
+  const total = state.lastTrades.length;
+  const recentWinRate = total > 0 ? wins / total : 0.5;
+  state.confidence = Math.max(0.3, Math.min(1, 0.4 + recentWinRate * 0.6));
 }

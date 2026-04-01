@@ -6,7 +6,6 @@
 
 import {
   DriftClient,
-  BulkAccountLoader,
   Wallet,
   PerpMarkets,
   SpotMarkets,
@@ -85,17 +84,14 @@ export class ExecutionEngine {
   }
 
   async initialize(): Promise<void> {
-    const accountLoader = new BulkAccountLoader(this.connection as any, "confirmed", 1000);
-
     this.client = new DriftClient({
       connection: this.connection as any,
       wallet: this.wallet,
       programID: new PublicKey(process.env.DRIFT_PROGRAM_ID ?? "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH"),
       accountSubscription: {
-        type: "polling",
-        accountLoader,
+        type: "websocket",
       },
-      env: "mainnet-beta",
+      env: (process.env.DRIFT_ENV ?? "devnet") as "mainnet-beta" | "devnet",
     });
 
     await this.client.subscribe();
@@ -110,7 +106,7 @@ export class ExecutionEngine {
 
   // ─── Open delta-neutral position ──────────────────────────────────────────
   // Simultaneously opens a perp SHORT on Drift.
-  // The spot LONG should be opened via Jupiter (see spotHedge.ts).
+  // The spot LONG should be opened via Drift spot markets (see liveExecution.ts).
   async openPerpShort(asset: Asset, usdNotional: number): Promise<OrderResult> {
     this.assertInitialized();
     const marketIndex = MARKET_INDEX[asset];

@@ -28,6 +28,7 @@ import {
 import { Connection, PublicKey, Transaction } from "@solana/web3.js";
 import { ServerWallet } from "./walletIntegration";
 import { Logger } from "./logger";
+import { JupiterSwapper } from "./jupiterSwap";
 
 // ─── Market config ────────────────────────────────────────────────────────────
 export const PERP_MARKET = {
@@ -76,6 +77,7 @@ export class LiveExecutionEngine {
   private connection: Connection;
   private wallet: ServerWallet;
   private logger: Logger;
+  private jupiterSwapper: JupiterSwapper;
   private orderLog: OrderRecord[] = [];
   private openPositions: Map<Asset, DeltaNeutralPosition> = new Map();
 
@@ -89,6 +91,7 @@ export class LiveExecutionEngine {
     this.connection = connection;
     this.wallet = wallet;
     this.logger = logger;
+    this.jupiterSwapper = new JupiterSwapper(connection, wallet, logger);
   }
 
   // ─── CORE: Open delta-neutral position ─────────────────────────────────
@@ -126,16 +129,19 @@ export class LiveExecutionEngine {
       legs: [],
     };
 
-    // ── LEG 1: Spot leg via Drift (SKIP for now due to minimum order size constraints) ───
-    // Drift spot requires buying 1 full BTC (~$68k) or 1 full ETH (~$2.1k) as minimum.
-    // For small vaults, this is infeasible. Instead, pursue perp-only positions
-    // that still capture funding arbitrage without spot collateral requirements.
-    this.logger.info(
-      `${asset}: Skipping spot leg (Drift minimum is 1 ${asset} ≈ $${
-        asset === "BTC" ? "68000" : "2100"
-      }). Using perp-only for funding arbitrage.`
-    );
+    // ── LEG 1: Spot leg via Jupiter ───────────────────────────────────────
+    // Jupiter allows swaps at any size with no minimums, unlike Drift
+    const spotLeg = side === "short-perp"
+      ? await this.jupiterSpotSwap("USDC", asset, amount)
+      : await this.jupiterSpotSwap(asset, "USDC", amount);
+    position.legs.push(spotLeg);
 
+    if (spotLeg.status === "FAILED") {
+      this.logger.error(`${asset}: Spot leg failed — aborting. No perp order sent.`);
+      return null;
+    }
+    position.spotNotional = amount;
+    this.logger.trade(`${asset}: Spot leg FILLED — tx: ${spotLeg.txSig}`);
 
 
     // ── LEG 2: Perp leg via Drift ───────────────────────────────────────
@@ -170,8 +176,8 @@ export class LiveExecutionEngine {
     // Close spot leg only if it was opened (spotNotional > 0)
     if (pos.spotNotional > 0) {
       const spotClose = pos.side === "short-perp"
-        ? await this.driftSpotSwap(asset, "USDC", pos.spotNotional)
-        : await this.driftSpotSwap("USDC", asset, pos.spotNotional);
+        ? await this.jupiterSpotSwap(asset, "USDC", pos.spotNotional)
+        : await this.jupiterSpotSwap("USDC", asset, pos.spotNotional);
       pos.legs.push(spotClose);
     }
 
@@ -300,7 +306,7 @@ export class LiveExecutionEngine {
   }
 
   // ─── DRIFT SPOT: Swap tokens via Drift spot markets ─────────────────────────
-  private async driftSpotSwap(
+  private async jupiterSpotSwap(
     from: "USDC" | "BTC" | "ETH",
     to: "USDC" | "BTC" | "ETH",
     usdAmount: number
@@ -310,64 +316,22 @@ export class LiveExecutionEngine {
     const record = this.newRecord(asset as Asset, "SPOT", side, usdAmount);
 
     try {
-      // Drift spot markets have a minimum order size of 100 USDC worth
-      const DRIFT_SPOT_MIN_USD = 100;
-      if (usdAmount < DRIFT_SPOT_MIN_USD) {
-        throw new Error(
-          `Spot order size $${usdAmount.toFixed(0)} below Drift minimum of $${DRIFT_SPOT_MIN_USD}`
-        );
-      }
-
-      const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
-
-      // For spot swaps, order is on the asset market (the crypto being traded)
-      const assetMarketIndex = SPOT_MARKET[asset as keyof typeof SPOT_MARKET].index;
-      const assetDecimals = DECIMALS[asset];
-
-      // Calculate quantity of asset
-      let assetAmountRaw: number;
-
-      if (asset === "USDC") {
-        // Trading USDC: $100 = 100 * 10^6 base units
-        assetAmountRaw = Math.floor(usdAmount * Math.pow(10, assetDecimals));
-      } else {
-        // Trading BTC/ETH: convert USD to token quantity using price
-        const markPrice = asset === "BTC"
-          ? convertToNumber(this.driftClient.getPerpMarketAccount(1)!.amm.lastMarkPriceTwap, PRICE_PRECISION)
-          : convertToNumber(this.driftClient.getPerpMarketAccount(2)!.amm.lastMarkPriceTwap, PRICE_PRECISION);
-
-        const tokenQuantity = usdAmount / markPrice;
-        assetAmountRaw = Math.floor(tokenQuantity * Math.pow(10, assetDecimals));
-      }
-
-      const baseAmountBN = new BN(assetAmountRaw);
-
-      // Direction: LONG if buying asset (from=USDC), SHORT if selling asset (from=BTC/ETH)
-      const direction = from === "USDC" ? PositionDirection.LONG : PositionDirection.SHORT;
-
-      // Place order on the asset market
-      const orderParams = getMarketOrderParams({
-        marketIndex: assetMarketIndex,
-        direction,
-        baseAssetAmount: baseAmountBN,
-        marketType: MarketType.SPOT,
-        reduceOnly: false,
-      });
-
-      const txSig = await this.driftClient.placeSpotOrder(orderParams);
-      await this.connection.confirmTransaction(txSig, "confirmed");
+      // Execute swap via Jupiter
+      const swapResult = await this.jupiterSwapper.swap(from, to, usdAmount);
 
       // Record successful swap
-      record.txSig = txSig;
+      record.txSig = swapResult.txSig;
       record.status = "FILLED";
-      record.slippagePct = 0.1; // Assume minimal slippage on Drift spot
-      record.fillPrice = 1; // Simplified - would need real price from market data
+      record.slippagePct = swapResult.slippagePct;
+      record.fillPrice = 1; // Price data from Jupiter would be needed for accuracy
 
-      this.logger.trade(`Drift Spot ${from}→${to} | amount=$${usdAmount.toFixed(0)} | tx=${txSig}`);
+      this.logger.trade(
+        `Jupiter Spot ${from}→${to} | amount=$${usdAmount.toFixed(0)} | slippage=${record.slippagePct.toFixed(2)}% | tx=${swapResult.txSig}`
+      );
     } catch (err: any) {
       record.status = "FAILED";
       record.error = err.message;
-      this.logger.error(`Drift spot swap ${from}→${to} failed: ${err.message}`);
+      this.logger.error(`Jupiter spot swap ${from}→${to} failed: ${err.message}`);
     }
 
     this.orderLog.push(record);

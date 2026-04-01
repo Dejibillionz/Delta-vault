@@ -111,7 +111,7 @@ export class TelegramAlerts {
         `Asset:  ${asset}`,
         `Type:   ${type}`,
         `Size:   $${sizeUsd.toLocaleString("en-US", { maximumFractionDigits: 0 })}`,
-        `Legs:   Spot long (Jupiter) + Perp short (Drift)`,
+        `Legs:   Spot long (Drift) + Perp short (Drift)`,
       ].join("\n"),
       txSig,
     });

@@ -1,6 +1,7 @@
 import { AgentState } from "./state";
 
 const BASE_SIZE = 1_000;
+const MIN_SIZE  = 30; // Drift protocol minimum notional
 
 export function getPositionSize(state: AgentState, volatility: number): number {
   let size = BASE_SIZE;
@@ -15,5 +16,5 @@ export function getPositionSize(state: AgentState, volatility: number): number {
 
   size *= state.confidence;
 
-  return Math.max(size, 0);
+  return Math.max(size, MIN_SIZE);
 }
