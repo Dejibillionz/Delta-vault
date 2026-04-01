@@ -287,10 +287,12 @@ async function main() {
   }
 
   async function deployToLending(asset: string, amount: number): Promise<number> {
-    // simulate yield
+    // simulate yield (only in DEMO mode — live PnL comes from real trades)
     const apy = 0.08; // 8% yearly
     const perCycleYield = (amount * apy) / (365 * 24 * 60); // per minute approx
-    simulatedPnl += perCycleYield;
+    if (DEMO_MODE) {
+      simulatedPnl += perCycleYield;
+    }
     currentStrategies[asset] = "LENDING";
     return perCycleYield;
   }
@@ -572,7 +574,13 @@ async function main() {
         // Capital manager: reserve for trade first, then lend leftover later
         const isOpenSignal = signal.signal === "DELTA_NEUTRAL_OPEN" || signal.signal === "BASIS_TRADE_OPEN";
         let executionSizeUSD = 0;
-        if (isOpenSignal) {
+
+        // Guard: don't open if position already exists for this asset
+        const hasOpenPosition = positions.has(`${asset}_SPOT`) || positions.has(`${asset}_PERP`);
+        if (isOpenSignal && hasOpenPosition) {
+          logger.info(`${asset}: Position already open — skipping new ${signal.signal}`);
+          executionData.events.push(`${asset}: position already open — skipped duplicate entry`);
+        } else if (isOpenSignal) {
           const blockedByAgent =
             (agentDecision?.action === "SKIP") ||
             (agentDecision?.action === "TRADE" && agentDecision.asset !== asset);
