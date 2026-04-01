@@ -316,34 +316,34 @@ export class LiveExecutionEngine {
     try {
       const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
 
-      // For spot swap orders, use the TO token's market index (what we're trading FOR)
-      const toMarketIndex = SPOT_MARKET[to as keyof typeof SPOT_MARKET].index;
-      const toDecimals = DECIMALS[to];
+      // For spot swaps, order is on the asset market (the crypto being traded)
+      const assetMarketIndex = SPOT_MARKET[asset as keyof typeof SPOT_MARKET].index;
+      const assetDecimals = DECIMALS[asset];
 
-      // Calculate how much of the TO token we want
-      let toAmountRaw: number;
+      // Calculate quantity of asset
+      let assetAmountRaw: number;
 
-      if (to === "USDC") {
-        // Buying USDC: amount is directly in USD terms
-        toAmountRaw = Math.floor(usdAmount * Math.pow(10, toDecimals));
+      if (asset === "USDC") {
+        // Trading USDC: $30 = 30 * 10^6 base units
+        assetAmountRaw = Math.floor(usdAmount * Math.pow(10, assetDecimals));
       } else {
-        // Buying BTC/ETH: get current price and convert USD to token quantity
-        const markPrice = to === "BTC"
+        // Trading BTC/ETH: convert USD to token quantity using price
+        const markPrice = asset === "BTC"
           ? convertToNumber(this.driftClient.getPerpMarketAccount(1)!.amm.lastMarkPriceTwap, PRICE_PRECISION)
           : convertToNumber(this.driftClient.getPerpMarketAccount(2)!.amm.lastMarkPriceTwap, PRICE_PRECISION);
 
         const tokenQuantity = usdAmount / markPrice;
-        toAmountRaw = Math.floor(tokenQuantity * Math.pow(10, toDecimals));
+        assetAmountRaw = Math.floor(tokenQuantity * Math.pow(10, assetDecimals));
       }
 
-      const baseAmountBN = new BN(toAmountRaw);
+      const baseAmountBN = new BN(assetAmountRaw);
 
-      // Direction: LONG if buying (from=USDC), SHORT if selling (to=USDC)
+      // Direction: LONG if buying asset (from=USDC), SHORT if selling asset (from=BTC/ETH)
       const direction = from === "USDC" ? PositionDirection.LONG : PositionDirection.SHORT;
 
-      // Use getMarketOrderParams with the TO token's market index
+      // Place order on the asset market
       const orderParams = getMarketOrderParams({
-        marketIndex: toMarketIndex,
+        marketIndex: assetMarketIndex,
         direction,
         baseAssetAmount: baseAmountBN,
         marketType: MarketType.SPOT,
