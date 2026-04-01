@@ -10,8 +10,11 @@ import { CROSS_CHAIN_CONFIG } from "../config/crossChain";
 type FundingByAsset = { BTC: number; ETH: number };
 type FundingByChain = Record<string, FundingByAsset>;
 
-// Mock chain feeds (replace with real venue SDK/APIs later)
+// Mock chain feeds — DEVNET ONLY (returns zero on mainnet to disable cross-chain arb)
 async function getMockFunding(chain: string): Promise<FundingByAsset> {
+  if (process.env.SOLANA_NETWORK === "mainnet-beta") {
+    return { BTC: 0, ETH: 0 };
+  }
   const MOCK: Record<string, FundingByAsset> = {
     arbitrum: { BTC: 0.00015, ETH: 0.00012 },
     base: { BTC: 0.00022, ETH: 0.00019 },

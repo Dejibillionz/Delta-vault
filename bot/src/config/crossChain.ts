@@ -29,6 +29,7 @@ export const CROSS_CHAIN_CONFIG = {
   // We compare one-time move costs vs projected funding edge over this horizon.
   PROFIT_HORIZON_HOURS: 24,
 
-  // Keep true for hackathon safety
-  SIMULATION_MODE: true,
+  // true = log-only (no real bridge/execution). Auto-enabled on devnet.
+  // Set to false only when real bridge SDK is integrated.
+  SIMULATION_MODE: process.env.SOLANA_NETWORK !== "mainnet-beta" || true,
 } as const;

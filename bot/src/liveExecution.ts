@@ -371,11 +371,16 @@ export class LiveExecutionEngine {
       // Execute swap via Jupiter
       const swapResult = await this.jupiterSwapper.swap(from, to, usdAmount);
 
-      // Calculate actual base quantity received
-      // outputAmount is in base units (e.g. satoshis for BTC = 8 decimals, lamports for USDC = 6)
+      // Calculate actual base quantity (the non-USDC token amount)
+      // When buying (USDC→BTC): base qty = output (BTC received)
+      // When selling (ETH→USDC): base qty = input (ETH sold)
       const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
-      const toDecimals = DECIMALS[to];
-      const baseQuantity = swapResult.outputAmount / Math.pow(10, toDecimals);
+      const isBuying = from === "USDC";
+      const baseToken = isBuying ? to : from;
+      const baseDecimals = DECIMALS[baseToken];
+      const baseQuantity = isBuying
+        ? swapResult.outputAmount / Math.pow(10, baseDecimals)
+        : swapResult.inputAmount / Math.pow(10, baseDecimals);
       const effectivePrice = usdAmount / baseQuantity;
 
       // Record successful swap

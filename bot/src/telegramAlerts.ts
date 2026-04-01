@@ -66,8 +66,9 @@ export class TelegramAlerts {
     if (wait > 0) await sleep(wait);
 
     const emoji = EMOJI[msg.level];
+    const cluster = process.env.SOLANA_NETWORK === "mainnet-beta" ? "" : "?cluster=devnet";
     const explorer = msg.txSig
-      ? `\n🔗 <a href="https://solscan.io/tx/${msg.txSig}?cluster=devnet">View tx</a>`
+      ? `\n🔗 <a href="https://solscan.io/tx/${msg.txSig}${cluster}">View tx</a>`
       : "";
 
     const text = [

@@ -10,7 +10,7 @@ use strategy::*;
 use risk::*;
 use fees::*;
 
-declare_id!("DeLtAVauLt11111111111111111111111111111111111");
+declare_id!("FQ99NWkE3f6HUdMcG312FCWvAT4iR4DTrTb9JA8xi471");
 
 /// Delta Vault — Adaptive Delta-Neutral Strategy
 ///

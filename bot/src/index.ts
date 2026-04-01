@@ -37,6 +37,7 @@ import { logAgent, logDecision }                     from "./agent/logger";
 
 // Cross-chain imports
 import { getCrossChainFunding }                       from "./services/crossChainFunding";
+import { LendingManager }                             from "./services/lending";
 import { evaluateCrossChain }                         from "./strategy/crossChainDecision";
 import { executeCrossChain }                          from "./strategy/crossChainExecutor";
 import { CROSS_CHAIN_CONFIG }                         from "./config/crossChain";
@@ -161,6 +162,7 @@ async function main() {
   let tick = 0;
   let simulatedPnl = 0; // Simulated profit for demo
   let currentStrategies: Record<string, string> = { BTC: "PARKED", ETH: "PARKED" };
+  const lendingManager = new LendingManager(driftClient, logger);
   let previousSnapshots: Record<string, LiveMarketSnapshot> = {};
   let latestDrawdown = 0;
   let tradeCarryOver: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
@@ -287,14 +289,12 @@ async function main() {
   }
 
   async function deployToLending(asset: string, amount: number): Promise<number> {
-    // simulate yield (only in DEMO mode — live PnL comes from real trades)
-    const apy = 0.08; // 8% yearly
-    const perCycleYield = (amount * apy) / (365 * 24 * 60); // per minute approx
+    const result = await lendingManager.deploy(amount);
     if (DEMO_MODE) {
-      simulatedPnl += perCycleYield;
+      simulatedPnl += result.yield;
     }
     currentStrategies[asset] = "LENDING";
-    return perCycleYield;
+    return result.yield;
   }
 
   // ── Risk loop — 10s ────────────────────────────────────────────────────────
@@ -581,16 +581,10 @@ async function main() {
           logger.info(`${asset}: Position already open — skipping new ${signal.signal}`);
           executionData.events.push(`${asset}: position already open — skipped duplicate entry`);
         } else if (isOpenSignal) {
-          const blockedByAgent =
-            (agentDecision?.action === "SKIP") ||
-            (agentDecision?.action === "TRADE" && agentDecision.asset !== asset);
+          const blockedByAgent = (agentDecision?.action === "SKIP");
 
           if (blockedByAgent) {
-            if (agentDecision?.action === "SKIP") {
-              executionData.events.push(`${asset}: AI agent skipped (${agentDecision.reason})`);
-            } else if (agentDecision?.action === "TRADE") {
-              executionData.events.push(`${asset}: AI agent selected ${agentDecision.asset}`);
-            }
+            executionData.events.push(`${asset}: AI agent skipped (${agentDecision.reason})`);
           } else {
             const requestedExecutionUSDRaw = Math.min(
               capitalPerAsset,

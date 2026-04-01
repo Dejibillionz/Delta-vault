@@ -9,11 +9,11 @@ import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { ServerWallet } from "./walletIntegration";
 import { Logger } from "./logger";
 
-// Token mints on Solana devnet/mainnet
+// Token mints on Solana mainnet
 const TOKEN_MINTS = {
   USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-  BTC: "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5yfVKE",  // mSOL on devnet as proxy
-  ETH: "2FPyTwcZLUg1MDrwsyoP4D6s1tM7hAkHYRjkNb5w6Pxp", // mETH on devnet as proxy
+  BTC: "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  // Wrapped BTC (Portal)
+  ETH: "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  // Wrapped ETH (Portal)
 };
 
 export interface SwapQuote {
@@ -37,6 +37,7 @@ export class JupiterSwapper {
   private connection: Connection;
   private wallet: ServerWallet;
   private logger: Logger;
+  private isMainnet: boolean;
 
   private readonly JUPITER_API = "https://quote-api.jup.ag/v6";
   private readonly SLIPPAGE_BPS = 100; // 1% slippage tolerance
@@ -45,6 +46,7 @@ export class JupiterSwapper {
     this.connection = connection;
     this.wallet = wallet;
     this.logger = logger;
+    this.isMainnet = process.env.SOLANA_NETWORK === "mainnet-beta";
   }
 
   /**
@@ -65,9 +67,12 @@ export class JupiterSwapper {
         `Jupiter Quote: ${from}→${to} | in=${quote.inputAmount} | out=${quote.outputAmount} | impact=${quote.priceImpactPct.toFixed(3)}%`
       );
 
-      // Check if this is a mock (devnet offline)
+      // Check if this is a mock (devnet offline) — never allow on mainnet
       if (quote.routePlan[0]?.swapInfo?.label === "MOCK") {
-        // For devnet: simulate successful swap with fake tx sig
+        if (this.isMainnet) {
+          throw new Error(`Jupiter API returned mock quote on mainnet — aborting ${from}→${to} swap`);
+        }
+        // Devnet only: simulate successful swap with fake tx sig
         const fakeTxSig = `MockTx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
         this.logger.trade(
           `Jupiter Swap (MOCK) ${from}→${to} | amount=$${amountUSD.toFixed(2)} | tx=${fakeTxSig}`
@@ -108,6 +113,9 @@ export class JupiterSwapper {
       };
     } catch (err: any) {
       if (err.message === "MOCK_SWAP_OFFLINE") {
+        if (this.isMainnet) {
+          throw new Error(`Jupiter swap API unreachable on mainnet — aborting ${from}→${to}`);
+        }
         // Devnet offline mode: simulate successful swap with price conversion
         const fakeTxSig = `MockTx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
         this.logger.info(`Jupiter offline mode: simulating ${from}→${to} swap with tx ${fakeTxSig}`);
@@ -118,8 +126,11 @@ export class JupiterSwapper {
         const fromDecimals = from === "USDC" ? 6 : 8;
         const toDecimals = to === "USDC" ? 6 : 8;
 
-        const inputAmount = Math.floor(amountUSD * Math.pow(10, fromDecimals));
-        const usdValue = amountUSD * fromPrice;
+        // amountUSD is in USD — convert to input token amount
+        const inputTokens = amountUSD / fromPrice;  // e.g. $100 / $2150 = 0.0465 ETH
+        const inputAmount = Math.floor(inputTokens * Math.pow(10, fromDecimals));
+        // amountUSD is always in USD — don't multiply by fromPrice again
+        const usdValue = amountUSD;
         const outputTokens = usdValue / toPrice;
         const outputAmount = Math.floor(outputTokens * 0.99 * Math.pow(10, toDecimals));
 
@@ -151,7 +162,10 @@ export class JupiterSwapper {
 
     // Convert USD amount to token amount (use standard decimals: 6 for USDC, 8 for others)
     const decimals = from === "USDC" ? 6 : 8;
-    const inputAmount = Math.floor(amountUSD * Math.pow(10, decimals));
+    const MOCK_PRICES: Record<string, number> = { USDC: 1, BTC: 68500, ETH: 2150 };
+    const fromPrice = MOCK_PRICES[from] ?? 1;
+    const inputTokens = amountUSD / fromPrice;  // e.g. $100 / $2150 = 0.0465 ETH
+    const inputAmount = Math.floor(inputTokens * Math.pow(10, decimals));
 
     const params = {
       inputMint,
@@ -180,19 +194,16 @@ export class JupiterSwapper {
         routePlan: data.routePlan,
       };
     } catch (err: any) {
-      // Fallback: Mock quote for devnet/offline testing
-      if (err.code === "ENOTFOUND" || err.message.includes("Network")) {
+      // Fallback: Mock quote for devnet/offline testing ONLY
+      if ((err.code === "ENOTFOUND" || err.message.includes("Network")) && !this.isMainnet) {
         this.logger.info(`Jupiter API unavailable, using mock quote for ${from}→${to}`);
 
         // Mock: convert between tokens using approximate prices, then apply 1% slippage
-        const MOCK_PRICES: Record<string, number> = { USDC: 1, BTC: 68500, ETH: 2150 };
-        const fromPrice = MOCK_PRICES[from] ?? 1;
         const toPrice = MOCK_PRICES[to] ?? 1;
         const toDecimals = to === "USDC" ? 6 : 8;
 
-        // Convert input USD value to output token amount
-        const usdValue = inputAmount * fromPrice / Math.pow(10, decimals);
-        const outputTokens = usdValue / toPrice;
+        // amountUSD is already in USD — convert directly to output tokens
+        const outputTokens = amountUSD / toPrice;
         const mockOutputAmount = Math.floor(outputTokens * 0.99 * Math.pow(10, toDecimals)); // 1% slippage
 
         return {
@@ -251,8 +262,8 @@ export class JupiterSwapper {
 
       return tx;
     } catch (err: any) {
-      // Fallback: Mock transaction for devnet/offline testing
-      if (err.code === "ENOTFOUND" || err.message.includes("Network")) {
+      // Fallback: Mock transaction for devnet/offline testing ONLY
+      if ((err.code === "ENOTFOUND" || err.message.includes("Network")) && !this.isMainnet) {
         this.logger.info(`Jupiter swap API unavailable, creating mock transaction`);
 
         // For devnet testing, we'll skip the actual transaction building

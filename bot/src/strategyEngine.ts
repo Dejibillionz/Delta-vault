@@ -12,21 +12,23 @@ import { LiveMarketSnapshot } from "./realMarketData";
 import { Logger } from "./logger";
 
 // ─── Strategy thresholds ──────────────────────────────────────────────────────
+const IS_MAINNET = process.env.SOLANA_NETWORK === "mainnet-beta";
+
 export const THRESHOLDS = {
   // Minimum hourly funding rate to open delta-neutral position
-  FUNDING_RATE_MIN: 0.00001,      // 0.001% per hour = ~0.087% APR (relaxed for demo)
+  FUNDING_RATE_MIN: IS_MAINNET ? 0.0001 : 0.00001,      // mainnet: 0.01%/hr (~8.7% APR), devnet: 0.001%/hr
 
   // Minimum basis spread to execute basis trade
-  BASIS_SPREAD_MIN: 0.005,        // 0.5% (relaxed for demo)
+  BASIS_SPREAD_MIN: IS_MAINNET ? 0.01 : 0.005,           // mainnet: 1.0%, devnet: 0.5%
 
   // Funding rate below this → exit delta-neutral, too little yield
-  FUNDING_RATE_EXIT: 0.00005,     // 0.005% per hour
+  FUNDING_RATE_EXIT: IS_MAINNET ? 0.00005 : 0.00005,     // 0.005% per hour
 
   // Basis spread below this → exit basis trade, convergence complete
   BASIS_SPREAD_EXIT: 0.003,       // 0.3%
 
-  // Lowered to 0.1 to work on devnet (thin liquidity); raise to 0.3 for mainnet
-  MIN_LIQUIDITY_SCORE: 0.1,
+  // Minimum liquidity score to trade
+  MIN_LIQUIDITY_SCORE: IS_MAINNET ? 0.3 : 0.1,
 
   // Maximum position size as fraction of vault (per asset)
   MAX_POSITION_FRACTION: 0.4,

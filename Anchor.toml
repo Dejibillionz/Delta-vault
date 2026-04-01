@@ -3,10 +3,10 @@ seeds = false
 skip-lint = false
 
 [programs.devnet]
-delta_vault = "11111111111111111111111111111111"
+delta_vault = "FQ99NWkE3f6HUdMcG312FCWvAT4iR4DTrTb9JA8xi471"
 
 [programs.mainnet]
-delta_vault = "DeLtAVauLt11111111111111111111111111111111111"
+delta_vault = "FQ99NWkE3f6HUdMcG312FCWvAT4iR4DTrTb9JA8xi471"
 
 [registry]
 url = "https://api.apr.dev"
