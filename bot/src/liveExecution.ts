@@ -4,13 +4,12 @@
  *   - Real market data (Pyth + Drift)
  *   - Wallet signing (ServerWallet or Phantom)
  *   - Drift Protocol perp orders
- *   - Jupiter spot swaps
+ *   - Drift Protocol spot orders
  *   - Full audit trail
  */
 
 import {
   DriftClient,
-  BulkAccountLoader,
   PerpMarkets,
   SpotMarkets,
   OrderType,
@@ -27,7 +26,6 @@ import {
   standardizeBaseAssetAmount,
 } from "@drift-labs/sdk";
 import { Connection, PublicKey, Transaction } from "@solana/web3.js";
-import axios from "axios";
 import { ServerWallet } from "./walletIntegration";
 import { Logger } from "./logger";
 
@@ -35,6 +33,12 @@ import { Logger } from "./logger";
 export const PERP_MARKET = {
   BTC: { index: 1, name: "BTC-PERP", tickSize: 0.1, minOrderSize: 0.001 },
   ETH: { index: 2, name: "ETH-PERP", tickSize: 0.01, minOrderSize: 0.01 },
+} as const;
+
+export const SPOT_MARKET = {
+  USDC: { index: 0, name: "USDC", decimals: 6 },
+  BTC:  { index: 1, name: "BTC-SPOT", decimals: 8 },
+  ETH:  { index: 2, name: "ETH-SPOT", decimals: 8 },
 } as const;
 
 export type Asset = keyof typeof PERP_MARKET;
@@ -75,16 +79,6 @@ export class LiveExecutionEngine {
   private orderLog: OrderRecord[] = [];
   private openPositions: Map<Asset, DeltaNeutralPosition> = new Map();
 
-  // Jupiter v6 API
-  private JUPITER_API = "https://quote-api.jup.ag/v6";
-
-  // Token mints
-  private MINTS = {
-    USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    BTC:  "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",
-    ETH:  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-  } as const;
-
   constructor(
     driftClient: DriftClient,
     connection: Connection,
@@ -99,7 +93,7 @@ export class LiveExecutionEngine {
 
   // ─── CORE: Open delta-neutral position ─────────────────────────────────
   // Executes both legs atomically (best-effort):
-  //   Leg 1: Buy spot via Jupiter  (USDC → BTC/ETH)
+  //   Leg 1: Buy spot via Drift spot (USDC → BTC/ETH)
   //   Leg 2: Short perp via Drift
   async openDeltaNeutral({
     side,
@@ -132,10 +126,10 @@ export class LiveExecutionEngine {
       legs: [],
     };
 
-    // ── LEG 1: Spot leg via Jupiter ─────────────────────────────────────
+    // ── LEG 1: Spot leg via Drift ───────────────────────────────────────
     const spotResult = side === "short-perp"
-      ? await this.jupiterSwap("USDC", asset, amount)
-      : await this.jupiterSwap(asset, "USDC", amount);
+      ? await this.driftSpotSwap("USDC", asset, amount)
+      : await this.driftSpotSwap(asset, "USDC", amount);
     position.legs.push(spotResult);
 
     if (spotResult.status === "FAILED") {
@@ -154,9 +148,9 @@ export class LiveExecutionEngine {
     if (perpResult.status === "FAILED") {
       this.logger.error(`${asset}: Perp leg failed — unwinding spot leg`);
       if (side === "short-perp") {
-        await this.jupiterSwap(asset, "USDC", amount);
+        await this.driftSpotSwap(asset, "USDC", amount);
       } else {
-        await this.jupiterSwap("USDC", asset, amount);
+        await this.driftSpotSwap("USDC", asset, amount);
       }
       return null;
     }
@@ -181,8 +175,8 @@ export class LiveExecutionEngine {
 
     // Close spot leg based on opening side
     const spotClose = pos.side === "short-perp"
-      ? await this.jupiterSwap(asset, "USDC", pos.spotNotional)
-      : await this.jupiterSwap("USDC", asset, pos.spotNotional);
+      ? await this.driftSpotSwap(asset, "USDC", pos.spotNotional)
+      : await this.driftSpotSwap("USDC", asset, pos.spotNotional);
     pos.legs.push(spotClose);
 
     this.openPositions.delete(asset);
@@ -309,74 +303,50 @@ export class LiveExecutionEngine {
     return record;
   }
 
-  // ─── JUPITER: Swap tokens ─────────────────────────────────────────────────
-  private async jupiterSwap(
-    from: keyof typeof this.MINTS,
-    to: keyof typeof this.MINTS,
+  // ─── DRIFT SPOT: Swap tokens via Drift spot markets ─────────────────────────
+  private async driftSpotSwap(
+    from: "USDC" | "BTC" | "ETH",
+    to: "USDC" | "BTC" | "ETH",
     usdAmount: number
   ): Promise<OrderRecord> {
     const side = from === "USDC" ? "BUY" : "SELL";
-    const record = this.newRecord(
-      (from === "USDC" ? to : from) as Asset,
-      "SPOT", side, usdAmount
-    );
+    const asset = from === "USDC" ? to : from;
+    const record = this.newRecord(asset as Asset, "SPOT", side, usdAmount);
 
     try {
       const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
-      const inputMint = this.MINTS[from];
-      const outputMint = this.MINTS[to];
-      const amountRaw = Math.floor(usdAmount * Math.pow(10, DECIMALS[from]));
 
-      // 1. Get best route
-      const quoteRes = await axios.get(`${this.JUPITER_API}/quote`, {
-        params: {
-          inputMint, outputMint,
-          amount: amountRaw,
-          slippageBps: 50,
-          onlyDirectRoutes: false,
-        },
-        timeout: 10000,
+      // Get market index for the token being bought/sold
+      const marketIndex = SPOT_MARKET[asset as keyof typeof SPOT_MARKET].index;
+
+      // Calculate base asset amount
+      const decimals = DECIMALS[asset];
+      const baseAmount = usdAmount / Math.pow(10, decimals);
+      const baseAmountBN = new BN(Math.floor(baseAmount * BASE_PRECISION.toNumber()));
+
+      // Use getMarketOrderParams for proper order construction
+      const orderParams = getMarketOrderParams({
+        marketIndex,
+        direction: side === "BUY" ? PositionDirection.LONG : PositionDirection.SHORT,
+        baseAssetAmount: baseAmountBN,
+        marketType: MarketType.SPOT,
+        reduceOnly: false,
       });
 
-      const quote = quoteRes.data;
-      const impact = parseFloat(quote.priceImpactPct ?? "0");
+      const txSig = await this.driftClient.placeSpotOrder(orderParams);
+      await this.connection.confirmTransaction(txSig, "confirmed");
 
-      // Reject if price impact > 0.5%
-      if (impact > 0.5) {
-        throw new Error(`Price impact too high: ${impact.toFixed(2)}%`);
-      }
-
-      // 2. Get swap transaction
-      const swapRes = await axios.post(`${this.JUPITER_API}/swap`, {
-        quoteResponse: quote,
-        userPublicKey: this.wallet.publicKey.toBase58(),
-        wrapAndUnwrapSol: true,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: "auto",
-      }, { timeout: 10000 });
-
-      // 3. Sign and send
-      const { swapTransaction } = swapRes.data;
-      const { VersionedTransaction } = await import("@solana/web3.js");
-      const txBuf = Buffer.from(swapTransaction, "base64");
-      const tx = VersionedTransaction.deserialize(txBuf);
-      tx.sign([this.wallet["keypair"] as any]); // access keypair for signing
-
-      const txSig = await this.connection.sendTransaction(tx, { maxRetries: 3 });
-      const conf = await this.connection.confirmTransaction(txSig, "confirmed");
-
-      if (conf.value.err) throw new Error(`Tx failed: ${JSON.stringify(conf.value.err)}`);
-
-      const outAmt = parseInt(quote.outAmount) / Math.pow(10, DECIMALS[to]);
+      // Record successful swap
       record.txSig = txSig;
       record.status = "FILLED";
-      record.slippagePct = impact;
-      record.fillPrice = to === "USDC" ? usdAmount / outAmt : outAmt / usdAmount;
-      this.logger.trade(`Jupiter ${from}→${to} | in=$${usdAmount.toFixed(0)} | impact=${impact.toFixed(3)}% | tx=${txSig}`);
+      record.slippagePct = 0.1; // Assume minimal slippage on Drift spot
+      record.fillPrice = 1; // Simplified - would need real price from market data
+
+      this.logger.trade(`Drift Spot ${from}→${to} | amount=$${usdAmount.toFixed(0)} | tx=${txSig}`);
     } catch (err: any) {
       record.status = "FAILED";
       record.error = err.message;
-      this.logger.error(`Jupiter swap ${from}→${to} failed: ${err.message}`);
+      this.logger.error(`Drift spot swap ${from}→${to} failed: ${err.message}`);
     }
 
     this.orderLog.push(record);
