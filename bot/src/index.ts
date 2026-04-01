@@ -907,7 +907,7 @@ async function handleSignalLive(
         fundingRate: signal.metadata.fundingRate,
       });
       if (pos) {
-        positions.set(asset, pos);
+        positions.set(`${asset}_SPOT`, pos);
         await telegram.tradeOpened(asset, type, executionSizeUSD);
         executed = true;
         events.push(`${asset}: ${type} opened ($${executionSizeUSD.toFixed(0)})`);
