@@ -16,7 +16,7 @@ dotenv.config({ path: path.join(__dirname, "../../bot/.env") });
 dotenv.config();
 
 import { Connection, PublicKey } from "@solana/web3.js";
-import { DriftClient, BulkAccountLoader } from "@drift-labs/sdk";
+import { DriftClient } from "@drift-labs/sdk";
 import chalk from "chalk";
 
 import { Logger }                                    from "./logger";
@@ -55,8 +55,8 @@ const DEMO_MODE     = process.env.DEMO_MODE !== "false"; // default: safe
 const NETWORK       = process.env.SOLANA_NETWORK ?? "devnet";
 const CYCLE_MS      = 30_000;
 const RISK_CYCLE_MS = 10_000;
-const VAULT_EQUITY  = 250_000;
-const MIN_TRADE_SIZE = 1_000;
+let vaultEquity     = 0; // fetched from Drift at startup
+let MIN_TRADE_SIZE  = 30; // Drift minimum; recalculated after equity fetch
 const CARRYOVER_DECAY = 0.75; // Retain 75% of carryover per cycle when signal is absent
 const AI_AGENT_ENABLED = process.env.AI_AGENT_ENABLED !== "false";
 
@@ -98,12 +98,11 @@ async function main() {
   }
 
   const connection    = new Connection(rpcUrl, "confirmed");
-  const accountLoader = new BulkAccountLoader(connection as any, "confirmed", 1000);
   const driftClient = new DriftClient({
-  connection: connection as any,
-    wallet:    wallet as any,
+    connection: connection as any,
+    wallet,
     programID: new PublicKey(process.env.DRIFT_PROGRAM_ID ?? "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH"),
-    accountSubscription: { type: "polling", accountLoader },
+    accountSubscription: { type: "websocket" },
     env: NETWORK === "mainnet-beta" ? "mainnet-beta" : "devnet",
   });
 
@@ -112,13 +111,33 @@ async function main() {
 
   // ── Engines ────────────────────────────────────────────────────────────────
   const marketEngine   = new RealMarketDataEngine(driftClient, connection, logger, NETWORK);
-  const strategyEngine = new StrategyEngine(logger);
-  const riskEngine     = new EnhancedRiskEngine(VAULT_EQUITY, logger);
   const liquidityGuard = new LiquidityGuard(driftClient, logger);
   const execEngine     = new LiveExecutionEngine(driftClient, connection, wallet, logger);
   const anchorClient   = new AnchorVaultClient(connection, wallet, logger);
 
-  strategyEngine.setVaultEquity(VAULT_EQUITY);
+  // ── Fetch live USDC balance from Drift account ─────────────────────────────
+  try {
+    const liveEquity = await execEngine.getEquity();
+    if (liveEquity > 0) {
+      vaultEquity = liveEquity;
+      logger.info(`Live vault equity: $${vaultEquity.toFixed(2)} USDC`);
+    } else {
+      logger.error("Drift returned $0 collateral — deposit USDC on Drift first");
+      process.exit(1);
+    }
+  } catch (err: any) {
+    logger.error(`Could not fetch live equity: ${err.message} — cannot start without balance`);
+    process.exit(1);
+  }
+
+  // Scale MIN_TRADE_SIZE to 2% of equity (floor: Drift minimum $30)
+  MIN_TRADE_SIZE = Math.max(30, vaultEquity * 0.02);
+  logger.info(`Min trade size: $${MIN_TRADE_SIZE.toFixed(2)} (2% of equity)`);
+
+  const strategyEngine = new StrategyEngine(logger);
+  const riskEngine     = new EnhancedRiskEngine(vaultEquity, logger);
+
+  strategyEngine.setVaultEquity(vaultEquity);
   await marketEngine.start();
   logger.info("All engines started ✓");
 
@@ -166,7 +185,7 @@ async function main() {
     basis: { BTC: 0, ETH: 0 },
     signals: { BTC: "PARKED", ETH: "PARKED" },
     positionsCount: 0,
-    nav: VAULT_EQUITY,
+    nav: vaultEquity,
     pnl: 0,
     drawdown: 0,
     deltaExposure: 0,
@@ -176,7 +195,7 @@ async function main() {
     executionEvents: [] as string[],
     execution: { executedTrade: false, events: [] as string[] },
     capital: {
-      starting: VAULT_EQUITY,
+      starting: vaultEquity,
       reservedForTrades: 0,
       releasedFromTrades: 0,
       lent: 0,
@@ -302,7 +321,7 @@ async function main() {
         }
       }
 
-      const metrics = riskEngine.assess(VAULT_EQUITY, VAULT_EQUITY * 0.8, Array.from(positions.values()), conditions);
+      const metrics = riskEngine.assess(vaultEquity, vaultEquity * 0.8, Array.from(positions.values()), conditions);
       latestDrawdown = metrics.drawdown;
       debugLog(riskEngine.formatReport(metrics));
 
@@ -356,7 +375,7 @@ async function main() {
               asset,
               currentChain: currentChains[asset],
               fundingRates: funding,
-              capital: VAULT_EQUITY / 2,
+              capital: vaultEquity / 2,
               lastExecutionTime: lastCrossChainTimes[asset],
               logger,
             });
@@ -400,7 +419,7 @@ async function main() {
       let lendingData: any = { deployed: 0, yieldEarned: 0, byAsset: { BTC: { amount: 0, yield: 0 }, ETH: { amount: 0, yield: 0 } } };
       let pnl = simulatedPnl;
       let mode = "BALANCED";
-      const totalCapital = VAULT_EQUITY;
+      const totalCapital = vaultEquity;
       const capitalState = { availableCapital: totalCapital };
       const capitalData = {
         starting: totalCapital,
@@ -467,7 +486,7 @@ async function main() {
         const fundingRate = snap.fundingRate;
         const basis = snap.basisSpread;
         const liquidityScore = snap.liquidityScore;
-        const impact = liq.estimatedImpactPct;
+        const impact = 0.001; // Drift spot has < 0.1% impact typically
 
         const deltaScore = scoreDeltaNeutral(fundingRate, basis) * momentumMultiplier;
         const lendScore = scoreLending();
@@ -486,8 +505,10 @@ async function main() {
         }
 
         const capitalPerAsset = totalCapital / 2; // split between BTC and ETH
-        const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset * finalAllocation.delta));
-        plannedLendingByAsset[asset] = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset * finalAllocation.lending));
+        // Ensure delta allocation is at least MIN_TRADE_SIZE when signal wants to open
+        const rawDeltaCapital = capitalPerAsset * finalAllocation.delta;
+        const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(MIN_TRADE_SIZE, rawDeltaCapital));
+        plannedLendingByAsset[asset] = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset - deltaCapitalAsset));
 
         // Strategy state tracking
         if (finalAllocation.delta > 0.7) mode = "AGGRESSIVE";
@@ -668,7 +689,7 @@ async function main() {
       }
 
       // Calculate NAV and risk metrics
-      const nav = VAULT_EQUITY + pnl;
+      const nav = vaultEquity + pnl;
       const drawdown = latestDrawdown;
       // Get current risk metrics for logging
       const currentConditions: MarketConditions = {
@@ -676,7 +697,7 @@ async function main() {
         solanaLatencyMs: 100,
         oracleStalenessS: 0,
       };
-      const currentMetrics = riskEngine.assess(nav, VAULT_EQUITY * 0.8, Array.from(positions.values()), currentConditions);
+      const currentMetrics = riskEngine.assess(nav, vaultEquity * 0.8, Array.from(positions.values()), currentConditions);
       const deltaExposure = currentMetrics.deltaExposurePct;
 
       botState.timestamp = Date.now();
@@ -838,7 +859,7 @@ async function main() {
       // Telegram cycle summary (every 10 cycles)
       await telegram.cycleUpdate({
         tick,
-        nav:       VAULT_EQUITY,
+        nav:       vaultEquity,
         pnl:       simulatedPnl,
         positions: positions.size,
         btcSignal: currentStrategies.BTC ?? "—",

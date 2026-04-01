@@ -38,59 +38,37 @@ export interface WalletInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 // SERVER WALLET — used by the live bot
 // Loads a keypair from disk or env var (base58-encoded private key)
+// Extends Drift SDK's Wallet to ensure full compatibility
 // ─────────────────────────────────────────────────────────────────────────────
-export class ServerWallet {
-  readonly publicKey: PublicKey;
-  private keypair: Keypair;
+export class ServerWallet extends Wallet {
   private logger: Logger;
 
   constructor(logger: Logger) {
-    this.logger = logger;
+    let keypair: Keypair;
 
     // Option A: load from keypair JSON file (array of bytes)
     const keypairPath = process.env.WALLET_KEYPAIR_PATH;
     if (keypairPath && fs.existsSync(keypairPath)) {
       const raw = JSON.parse(fs.readFileSync(keypairPath, "utf-8"));
-      this.keypair = Keypair.fromSecretKey(Uint8Array.from(raw));
-      this.logger.info(`ServerWallet loaded from file: ${keypairPath}`);
+      keypair = Keypair.fromSecretKey(Uint8Array.from(raw));
+      logger.info(`ServerWallet loaded from file: ${keypairPath}`);
     }
     // Option B: load from base58 env var
     else if (process.env.WALLET_PRIVATE_KEY_BASE58) {
       const decoded = bs58.decode(process.env.WALLET_PRIVATE_KEY_BASE58);
-      this.keypair = Keypair.fromSecretKey(decoded);
-      this.logger.info("ServerWallet loaded from WALLET_PRIVATE_KEY_BASE58 env var");
+      keypair = Keypair.fromSecretKey(decoded);
+      logger.info("ServerWallet loaded from WALLET_PRIVATE_KEY_BASE58 env var");
     } else {
       throw new Error(
         "No wallet configured. Set WALLET_KEYPAIR_PATH or WALLET_PRIVATE_KEY_BASE58 in .env"
       );
     }
 
-    this.publicKey = this.keypair.publicKey;
+    // Initialize parent Wallet class with keypair
+    super(keypair);
+
+    this.logger = logger;
     this.logger.info(`Vault wallet address: ${this.publicKey.toBase58()}`);
-  }
-
-  async signTransaction(tx: Transaction): Promise<Transaction> {
-    tx.sign(this.keypair);
-    return tx;
-  }
-
-  async signAllTransactions(txs: Transaction[]): Promise<Transaction[]> {
-    return txs.map(tx => {
-      tx.sign(this.keypair);
-      return tx;
-    });
-  }
-
-  async signVersionedTransaction(tx: VersionedTransaction): Promise<VersionedTransaction> {
-    tx.sign([this.keypair]);
-    return tx;
-  }
-
-  async signAllVersionedTransactions(txs: VersionedTransaction[]): Promise<VersionedTransaction[]> {
-    return txs.map(tx => {
-      tx.sign([this.keypair]);
-      return tx;
-    });
   }
 
   getAddress(): string {
