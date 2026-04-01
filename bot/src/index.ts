@@ -56,7 +56,7 @@ const NETWORK       = process.env.SOLANA_NETWORK ?? "devnet";
 const CYCLE_MS      = 30_000;
 const RISK_CYCLE_MS = 10_000;
 let vaultEquity     = 0; // fetched from Drift at startup
-let MIN_TRADE_SIZE  = 30; // Drift minimum; recalculated after equity fetch
+let MIN_TRADE_SIZE  = 100; // Drift spot minimum is $100 USDC; recalculated after equity fetch
 const CARRYOVER_DECAY = 0.75; // Retain 75% of carryover per cycle when signal is absent
 const AI_AGENT_ENABLED = process.env.AI_AGENT_ENABLED !== "false";
 
@@ -130,9 +130,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Scale MIN_TRADE_SIZE to 2% of equity (floor: Drift minimum $30)
-  MIN_TRADE_SIZE = Math.max(30, vaultEquity * 0.02);
-  logger.info(`Min trade size: $${MIN_TRADE_SIZE.toFixed(2)} (2% of equity)`);
+  // Scale MIN_TRADE_SIZE to 2% of equity (floor: Drift spot minimum $100)
+  MIN_TRADE_SIZE = Math.max(100, vaultEquity * 0.02);
+  logger.info(`Min trade size: $${MIN_TRADE_SIZE.toFixed(2)} (2% of equity, Drift spot minimum $100)`);
 
   const strategyEngine = new StrategyEngine(logger);
   const riskEngine     = new EnhancedRiskEngine(vaultEquity, logger);

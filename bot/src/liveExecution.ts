@@ -314,6 +314,14 @@ export class LiveExecutionEngine {
     const record = this.newRecord(asset as Asset, "SPOT", side, usdAmount);
 
     try {
+      // Drift spot markets have a minimum order size of 100 USDC worth
+      const DRIFT_SPOT_MIN_USD = 100;
+      if (usdAmount < DRIFT_SPOT_MIN_USD) {
+        throw new Error(
+          `Spot order size $${usdAmount.toFixed(0)} below Drift minimum of $${DRIFT_SPOT_MIN_USD}`
+        );
+      }
+
       const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
 
       // For spot swaps, order is on the asset market (the crypto being traded)
@@ -324,7 +332,7 @@ export class LiveExecutionEngine {
       let assetAmountRaw: number;
 
       if (asset === "USDC") {
-        // Trading USDC: $30 = 30 * 10^6 base units
+        // Trading USDC: $100 = 100 * 10^6 base units
         assetAmountRaw = Math.floor(usdAmount * Math.pow(10, assetDecimals));
       } else {
         // Trading BTC/ETH: convert USD to token quantity using price
