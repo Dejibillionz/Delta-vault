@@ -65,7 +65,8 @@ export class ServerWallet extends Wallet {
     }
 
     // Initialize parent Wallet class with keypair
-    super(keypair);
+    // Cast to any to resolve version mismatch between @solana/web3.js versions
+    super(keypair as any);
 
     this.logger = logger;
     this.logger.info(`Vault wallet address: ${this.publicKey.toBase58()}`);
