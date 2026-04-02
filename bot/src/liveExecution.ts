@@ -475,13 +475,22 @@ export class LiveExecutionEngine {
     const pos = this.openPositions.get(asset);
     if (!pos) return;
 
-    const ageMs = Date.now() - pos.openedAt;
-    const ageHours = ageMs / (1000 * 60 * 60);
+    const mi = PERP_MARKET[asset].index;
 
-    // Funding collected = position notional × funding rate × hours held
+    // Primary: read accrued PnL (including funding) directly from Drift user account
+    try {
+      const user = this.driftClient.getUser();
+      const pnlBN = user.getUnrealizedPNL(true, mi);
+      pos.unrealizedPnl = convertToNumber(pnlBN, QUOTE_PRECISION);
+      pos.fundingCollected = pos.unrealizedPnl;
+      return;
+    } catch {
+      // fallthrough to estimate if Drift read fails
+    }
+
+    // Fallback: estimate from funding rate × notional × time held
+    const ageHours = (Date.now() - pos.openedAt) / (1000 * 60 * 60);
     pos.fundingCollected = pos.perpNotional * fundingRate * ageHours;
-
-    // Set unrealizedPnl to funding collected (delta-neutral has no directional PnL)
     pos.unrealizedPnl = pos.fundingCollected;
   }
 

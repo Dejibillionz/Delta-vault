@@ -161,6 +161,9 @@ async function main() {
   const positions = new Map<string, any>();
   let tick = 0;
   let simulatedPnl = 0; // Simulated profit for demo
+  let cumulativeRealizedPnl = 0; // Running total of closed-position PnL
+  let cumulativeLendingYield = 0; // Running total of lending yield
+  const initialVaultEquity = vaultEquity; // snapshot at bot start for PnL baseline
   let currentStrategies: Record<string, string> = { BTC: "PARKED", ETH: "PARKED" };
   const lendingManager = new LendingManager(driftClient, logger);
   let previousSnapshots: Record<string, LiveMarketSnapshot> = {};
@@ -414,14 +417,20 @@ async function main() {
       }
 
       // ── Data Collection for Logging ──────────────────────────────────────────
+      // Refresh vault equity from Drift each cycle so PnL reflects real changes
+      try {
+        const freshEquity = await execEngine.getEquity();
+        if (freshEquity > 0) vaultEquity = freshEquity;
+      } catch { /* keep last known value */ }
+
       let marketData: any = {};
       let strategyData: any = { deltaCapital: 0, lendingCapital: 0 };
       let executionData: any = { executedTrade: false, events: [] as string[] };
       let riskData: any = {};
       let lendingData: any = { deployed: 0, yieldEarned: 0, byAsset: { BTC: { amount: 0, yield: 0 }, ETH: { amount: 0, yield: 0 } } };
-      // Calculate real PnL from open positions + lending yield
+      // PnL = current equity minus baseline equity at bot start
       const openPositionsPnL = Array.from(positions.values()).reduce((sum, pos) => sum + (pos.unrealizedPnl ?? 0), 0);
-      let pnl = openPositionsPnL + (lendingData.yieldEarned ?? 0);
+      let pnl = (vaultEquity - initialVaultEquity) + openPositionsPnL;
       let mode = "BALANCED";
       const totalCapital = vaultEquity;
       const capitalState = { availableCapital: totalCapital };
@@ -490,8 +499,15 @@ async function main() {
         let signal = strategyEngine.evaluate(snap); // default signal
 
         if (currentState === "DELTA_NEUTRAL" || currentState === "BASIS_TRADE") {
-          // Update position's realized/unrealized PnL
+          // Update position's realized/unrealized PnL (reads from Drift user account)
           execEngine.updatePositionPnL(asset, snap.fundingRate);
+
+          // Sync updated PnL back to the index.ts positions map so the summary displays it
+          const livePnL = execEngine.getOpenPositions().get(asset)?.unrealizedPnl ?? 0;
+          const perpPos = positions.get(`${asset}_PERP`);
+          if (perpPos) perpPos.unrealizedPnl = livePnL;
+          const spotPos = positions.get(`${asset}_SPOT`);
+          if (spotPos) spotPos.unrealizedPnl = 0; // PnL lives in the perp leg
 
           // Get entry funding rate from strategy engine
           const fundingExitEval = strategyEngine.shouldExitFundingBased(asset, snap.fundingRate);
@@ -670,6 +686,7 @@ async function main() {
                   strategyData.deltaCapital += executionSizeUSD;
                   tradeCarryOver[asset] = Math.max(0, requestedExecutionUSD - executionSizeUSD);
                   if (typeof liveExec.realizedPnl === "number") {
+                    cumulativeRealizedPnl += liveExec.realizedPnl;
                     updateState(aiAgentState, { asset, pnl: liveExec.realizedPnl });
                   }
                 } else {
@@ -738,6 +755,7 @@ async function main() {
           const yieldEarned = await deployToLending(asset, lendingCapitalAsset);
           lendingData.deployed += lendingCapitalAsset;
           lendingData.yieldEarned += yieldEarned;
+          cumulativeLendingYield += yieldEarned;
           lendingData.byAsset[asset].amount += lendingCapitalAsset;
           lendingData.byAsset[asset].yield += yieldEarned;
           executionData.events.push(`${asset}: lending deployed ($${lendingCapitalAsset.toFixed(0)})`);
