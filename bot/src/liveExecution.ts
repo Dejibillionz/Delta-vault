@@ -69,6 +69,7 @@ export interface DeltaNeutralPosition {
   entryFundingRate: number;
   fundingCollected: number;   // cumulative funding received
   unrealizedPnl: number;
+  status: "COMPLETE" | "INCOMPLETE"; // INCOMPLETE = spot filled but perp failed (naked)
   legs: OrderRecord[];
 }
 
@@ -127,6 +128,7 @@ export class LiveExecutionEngine {
       entryFundingRate: fundingRate,
       fundingCollected: 0,
       unrealizedPnl: 0,
+      status: "INCOMPLETE",
       legs: [],
     };
 
@@ -159,10 +161,29 @@ export class LiveExecutionEngine {
     position.legs.push(perpResult);
 
     if (perpResult.status === "FAILED") {
-      this.logger.error(`${asset}: Perp leg failed.`);
+      this.logger.error(`${asset}: Perp leg failed — spot already filled. Registering INCOMPLETE position and attempting unwind.`);
+      position.spotNotional = amount;
+      position.status = "INCOMPLETE";
+      this.openPositions.set(asset, position); // track it so risk loop can see and close it
+
+      // Attempt immediate spot unwind to remove naked exposure
+      try {
+        const unwindResult = side === "short-perp"
+          ? await this.jupiterSpotSwap(asset, "USDC", amount)    // sold USDC→BTC, now sell BTC→USDC
+          : await this.jupiterSpotSwap("USDC", asset, amount);   // sold BTC→USDC, now sell USDC→BTC
+        if (unwindResult.status === "FILLED") {
+          this.logger.trade(`${asset}: Naked spot unwound successfully — tx: ${unwindResult.txSig}`);
+          this.openPositions.delete(asset);
+        } else {
+          this.logger.error(`${asset}: Spot unwind FAILED — naked spot remains. Risk loop will retry.`);
+        }
+      } catch (unwindErr: any) {
+        this.logger.error(`${asset}: Spot unwind threw — naked spot remains: ${unwindErr.message}`);
+      }
       return null;
     }
     position.perpNotional = amount;
+    position.status = "COMPLETE";
     this.logger.trade(`${asset}: Perp leg FILLED — tx: ${perpResult.txSig}`);
 
     this.openPositions.set(asset, position);
@@ -174,6 +195,20 @@ export class LiveExecutionEngine {
   async closeDeltaNeutral(asset: Asset): Promise<void> {
     const pos = this.openPositions.get(asset);
     if (!pos) { this.logger.warn(`No open position to close for ${asset}`); return; }
+
+    if (pos.status === "INCOMPLETE") {
+      // Only spot was filled — no perp to close, just unwind spot
+      this.logger.trade(`Closing INCOMPLETE (naked spot) ${asset}`);
+      if (pos.spotNotional > 0) {
+        const spotClose = pos.side === "short-perp"
+          ? await this.jupiterSpotSwap(asset, "USDC", pos.spotNotional)
+          : await this.jupiterSpotSwap("USDC", asset, pos.spotNotional);
+        pos.legs.push(spotClose);
+      }
+      this.openPositions.delete(asset);
+      this.logger.trade(`${asset}: Naked spot closed.`);
+      return;
+    }
 
     this.logger.trade(`Closing DELTA-NEUTRAL ${asset}`);
 
@@ -497,6 +532,11 @@ export class LiveExecutionEngine {
   // ─── Getters ─────────────────────────────────────────────────────────────
   getOrderLog(): OrderRecord[] { return [...this.orderLog]; }
   getOpenPositions(): Map<Asset, DeltaNeutralPosition> { return this.openPositions; }
+  getIncompletePositions(): Asset[] {
+    return Array.from(this.openPositions.entries())
+      .filter(([, pos]) => pos.status === "INCOMPLETE")
+      .map(([asset]) => asset);
+  }
 
   async getEquity(): Promise<number> {
     try {

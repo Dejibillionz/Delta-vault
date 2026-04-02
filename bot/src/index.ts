@@ -337,15 +337,46 @@ async function main() {
         metrics.worstAction === "PAUSE_EXECUTION" ? 1 : 0
       );
 
-      // Handle critical events
+      // Handle critical events — act immediately, don't wait for the 30s strategy loop
       for (const ev of metrics.riskEvents) {
         if (ev.action === "EMERGENCY_CLOSE") {
           await telegram.emergencyStop(ev.message);
-          if (!DEMO_MODE) await execEngine.emergencyCloseAll();
+          for (const asset of ["BTC", "ETH"] as const) {
+            if (positions.has(`${asset}_SPOT`) || positions.has(`${asset}_PERP`)) {
+              logger.risk(`Risk loop: emergency closing ${asset}`);
+              await execEngine.closeDeltaNeutral(asset);
+              positions.delete(`${asset}_SPOT`);
+              positions.delete(`${asset}_PERP`);
+              strategyEngine.setState(asset, "NONE");
+            }
+          }
         }
-        if (["HIGH", "CRITICAL"].includes(ev.severity) && ev.action !== "NORMAL") {
+
+        if (ev.action === "CLOSE_POSITION" && ev.asset) {
+          const asset = ev.asset as "BTC" | "ETH";
+          if (positions.has(`${asset}_SPOT`) || positions.has(`${asset}_PERP`)) {
+            logger.risk(`Risk loop: closing ${asset} — ${ev.message}`);
+            await execEngine.closeDeltaNeutral(asset);
+            positions.delete(`${asset}_SPOT`);
+            positions.delete(`${asset}_PERP`);
+            strategyEngine.setState(asset, "NONE");
+            await telegram.tradeClosed(asset, 0);
+          }
+        }
+
+        if (["HIGH", "CRITICAL"].includes(ev.severity) && !["EMERGENCY_CLOSE", "CLOSE_POSITION", "NORMAL"].includes(ev.action)) {
           await telegram.riskAlert(ev.message, metrics.drawdown, metrics.deltaExposurePct);
         }
+      }
+
+      // Sweep any incomplete (naked spot) positions left from failed perp orders
+      const incomplete = execEngine.getIncompletePositions();
+      for (const asset of incomplete) {
+        logger.risk(`${asset}: INCOMPLETE position detected (naked spot) — unwinding via risk loop`);
+        await execEngine.closeDeltaNeutral(asset);
+        positions.delete(`${asset}_SPOT`);
+        positions.delete(`${asset}_PERP`);
+        strategyEngine.setState(asset, "NONE");
       }
 
       if (latencyMs > 500)  await telegram.networkCongested(latencyMs);
