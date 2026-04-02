@@ -122,19 +122,26 @@ async function main() {
   const anchorClient   = new AnchorVaultClient(connection, wallet, logger);
 
   // ── Fetch live USDC balance from Drift account ─────────────────────────────
-  try {
-    const liveEquity = await execEngine.getEquity();
-    if (liveEquity > 0) {
-      vaultEquity = liveEquity;
-      logger.info(`Live vault equity: $${vaultEquity.toFixed(2)} USDC`);
-    } else {
-      logger.error("Drift returned $0 collateral — deposit USDC on Drift first");
-      process.exit(1);
+  // Retry up to 5×2s: handles RPC jitter and WebSocket hydration lag after subscribe()
+  let liveEquity = 0;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      liveEquity = await execEngine.getEquity();
+      if (liveEquity > 0) break;
+      logger.warn(`Equity fetch attempt ${attempt}/5 returned $0 — waiting for account hydration...`);
+    } catch (err: any) {
+      logger.warn(`Equity fetch attempt ${attempt}/5 failed: ${err.message}`);
     }
-  } catch (err: any) {
-    logger.error(`Could not fetch live equity: ${err.message} — cannot start without balance`);
+    if (attempt < 5) await new Promise(r => setTimeout(r, 2000));
+  }
+
+  if (liveEquity <= 0) {
+    logger.error("Could not fetch equity after 5 attempts — deposit USDC on Drift first");
     process.exit(1);
   }
+
+  vaultEquity = liveEquity;
+  logger.info(`Live vault equity: $${vaultEquity.toFixed(2)} USDC`);
 
   // Scale MIN_TRADE_SIZE to 2% of equity (floor: Drift spot minimum $100)
   MIN_TRADE_SIZE = Math.max(100, vaultEquity * 0.02);
