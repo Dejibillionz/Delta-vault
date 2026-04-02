@@ -15,7 +15,7 @@ const LIQUIDITY_CONFIG = {
   MAX_OI_UTILIZATION: 0.80,
 } as const;
 
-export type Asset = "BTC" | "ETH";
+export type Asset = "BTC" | "ETH" | "SOL" | "JTO";
 
 export interface LiquidityCheck {
   allowed: boolean;
@@ -23,7 +23,7 @@ export interface LiquidityCheck {
   oiUtilization: number;
 }
 
-const DRIFT_MARKET_INDEX: Record<Asset, number> = { BTC: 1, ETH: 2 };
+const DRIFT_MARKET_INDEX: Record<string, number> = { SOL: 0, BTC: 1, ETH: 2, JTO: 20 };
 
 // ─── Liquidity Guard ──────────────────────────────────────────────────────────
 export class LiquidityGuard {
@@ -39,7 +39,7 @@ export class LiquidityGuard {
    * Liquidity check before placing a trade.
    * Checks Drift OI utilization to prevent saturation.
    */
-  async checkLiquidity(asset: Asset, tradeSizeUSD: number): Promise<LiquidityCheck> {
+  async checkLiquidity(asset: string, tradeSizeUSD: number): Promise<LiquidityCheck> {
     const oiCheck = await this.checkDriftOI(asset, tradeSizeUSD);
 
     if (!oiCheck.allowed) {
@@ -60,7 +60,7 @@ export class LiquidityGuard {
 
   // ─── Drift open interest utilization check ─────────────────────────────────
   private async checkDriftOI(
-    asset: Asset,
+    asset: string,
     tradeSizeUSD: number
   ): Promise<LiquidityCheck> {
     try {

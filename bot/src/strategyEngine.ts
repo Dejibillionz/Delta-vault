@@ -64,7 +64,7 @@ export interface ActiveState {
   [asset: string]: AssetStrategyState;
 }
 
-// Minimum ms funding must stay above threshold before entry (30s = 15 × 2s cycles)
+// Minimum ms funding must stay above threshold before entry (30s = 2 × 15s cycles)
 const MOMENTUM_WINDOW_MS = 30_000;
 
 // ─── Strategy Engine ──────────────────────────────────────────────────────────

@@ -321,9 +321,10 @@ export class LiveExecutionEngine {
     markPrice: number
   ): Promise<{ txSig: string; fillPrice: number }> {
     const dir = side === "SHORT" ? PositionDirection.SHORT : PositionDirection.LONG;
-    // Maker limit: price slightly inside the spread so it posts (not crosses)
-    // SHORT: bid just below mark; LONG: ask just above mark
-    const limitBias = side === "SHORT" ? 0.9998 : 1.0002;
+    // Maker limit: price on the passive side of the spread so it posts (not crosses)
+    // SHORT (sell): ask just above mark so we're on the offer side
+    // LONG  (buy):  bid just below mark so we're on the bid side
+    const limitBias = side === "SHORT" ? 1.0002 : 0.9998;
     const limitPrice = new BN(Math.floor(markPrice * limitBias * PRICE_PRECISION.toNumber()));
 
     const limitParams = getLimitOrderParams({
@@ -331,7 +332,7 @@ export class LiveExecutionEngine {
       direction: dir,
       baseAssetAmount: baseAmountBN,
       price: limitPrice,
-      postOnly: PostOnlyParams.MUST_POST_ONLY,
+      postOnly: PostOnlyParams.TRY_POST_ONLY,
       reduceOnly: false,
       marketType: MarketType.PERP,
     });
@@ -437,9 +438,22 @@ export class LiveExecutionEngine {
     const asset = from === "USDC" ? to : from;
     const record = this.newRecord(asset as Asset, "SPOT", side, usdAmount);
 
+    // When selling a non-USDC token, fetch its live mark price so Jupiter
+    // receives the correct token quantity instead of the stale MOCK_PRICES value.
+    let liveSpotPrice: number | undefined;
+    if (from !== "USDC") {
+      const mi = PERP_MARKET[from as keyof typeof PERP_MARKET]?.index;
+      if (mi !== undefined) {
+        try {
+          const mkt = this.driftClient.getPerpMarketAccount(mi);
+          if (mkt) liveSpotPrice = convertToNumber(mkt.amm.lastMarkPriceTwap, PRICE_PRECISION);
+        } catch { /* fall back to MOCK_PRICES inside JupiterSwapper */ }
+      }
+    }
+
     try {
       // Execute swap via Jupiter
-      const swapResult = await this.jupiterSwapper.swap(from, to, usdAmount);
+      const swapResult = await this.jupiterSwapper.swap(from, to, usdAmount, liveSpotPrice);
 
       // Calculate actual base quantity (the non-USDC token amount)
       // When buying (USDC→BTC): base qty = output (BTC received)
@@ -539,28 +553,38 @@ export class LiveExecutionEngine {
   }
 
   /**
-   * Update position's unrealized PnL based on current market conditions
+   * Update position's PnL.
+   * - unrealizedPnl: total perp PnL from Drift (mark-to-market + funding)
+   * - fundingCollected: estimated funding yield only (strategy's actual profit, no MTM noise)
+   *
+   * The MTM component is noise in a delta-neutral strategy — it cancels with the spot leg.
+   * Use fundingCollected to display how much yield the strategy has earned.
    */
   updatePositionPnL(asset: Asset, fundingRate: number): void {
     const pos = this.openPositions.get(asset);
     if (!pos) return;
 
     const mi = PERP_MARKET[asset].index;
+    const ageHours = (Date.now() - pos.openedAt) / (1000 * 60 * 60);
 
-    // Primary: read accrued PnL (including funding) directly from Drift user account
+    // Funding estimate: earned yield based on position side
+    // short-perp earns when funding is positive; long-perp earns when negative
+    const dir = pos.side === "short-perp" ? 1 : -1;
+    const effectiveRate = fundingRate * dir;
+    pos.fundingCollected = pos.perpNotional * Math.max(0, effectiveRate) * ageHours;
+
+    // Primary: read total perp PnL (MTM + funding) from Drift user account
     try {
       const user = this.driftClient.getUser();
       const pnlBN = user.getUnrealizedPNL(true, mi);
       pos.unrealizedPnl = convertToNumber(pnlBN, QUOTE_PRECISION);
-      pos.fundingCollected = pos.unrealizedPnl;
+      // Keep fundingCollected as the clean funding estimate (not overwritten with Drift total)
       return;
     } catch {
-      // fallthrough to estimate if Drift read fails
+      // fallthrough to estimate
     }
 
-    // Fallback: estimate from funding rate × notional × time held
-    const ageHours = (Date.now() - pos.openedAt) / (1000 * 60 * 60);
-    pos.fundingCollected = pos.perpNotional * fundingRate * ageHours;
+    // Fallback: use funding estimate as unrealizedPnl too
     pos.unrealizedPnl = pos.fundingCollected;
   }
 

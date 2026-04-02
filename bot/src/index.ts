@@ -54,8 +54,8 @@ function logSection(title: string) {
 // ── Config ────────────────────────────────────────────────────────────────────
 const DEMO_MODE     = process.env.DEMO_MODE !== "false"; // default: safe
 const NETWORK       = process.env.SOLANA_NETWORK ?? "devnet";
-const CYCLE_MS      = 2_000;   // 2s strategy loop
-const LOG_EVERY_N   = 15;      // log/API-update every Nth cycle (~30s at 2s)
+const CYCLE_MS      = 15_000;  // 15s strategy loop
+const LOG_EVERY_N   = 2;       // log/API-update every Nth cycle (~30s at 15s)
 const RISK_CYCLE_MS = 10_000;
 let vaultEquity     = 0; // fetched from Drift at startup
 let MIN_TRADE_SIZE  = 100; // Drift spot minimum is $100 USDC; recalculated after equity fetch
@@ -322,10 +322,14 @@ async function main() {
         const asset = pos.asset;
         const snap = marketEngine.getSnapshot(asset as any);
         if (snap && pos.entryPrice) {
-          // Use appropriate price for each leg
           const isSpot = key.includes('_SPOT');
           pos.markPrice = isSpot ? snap.spotPrice : snap.perpPrice;
-          pos.unrealizedPnl = (pos.entryPrice - pos.markPrice) * pos.baseAmount;
+          // Direction-aware PnL: LONG profits when price rises, SHORT profits when price falls
+          if (pos.direction === "LONG") {
+            pos.unrealizedPnl = (pos.markPrice - pos.entryPrice) * pos.baseAmount;
+          } else {
+            pos.unrealizedPnl = (pos.entryPrice - pos.markPrice) * pos.baseAmount;
+          }
         }
       }
 
@@ -468,9 +472,13 @@ async function main() {
         yieldEarned: 0,
         byAsset: Object.fromEntries(TRADING_ASSETS.map(a => [a, { amount: 0, yield: 0 }])),
       };
-      // PnL = current equity minus baseline equity at bot start
-      const openPositionsPnL = Array.from(positions.values()).reduce((sum, pos) => sum + (pos.unrealizedPnl ?? 0), 0);
-      let pnl = (vaultEquity - initialVaultEquity) + openPositionsPnL;
+      // ── PnL Calculation ──────────────────────────────────────────────────────
+      // Strategy PnL = funding earned (from open perp positions) + lending yield + realized closed trades.
+      // We deliberately exclude mark-to-market noise (price moves): in a delta-neutral position,
+      // the spot leg gain/loss exactly cancels the perp leg gain/loss, leaving only funding yield.
+      const openFundingYield = Array.from(execEngine.getOpenPositions().values())
+        .reduce((sum, pos) => sum + pos.fundingCollected, 0);
+      let pnl = cumulativeRealizedPnl + cumulativeLendingYield + openFundingYield;
       let mode = "BALANCED";
       const totalCapital = vaultEquity;
       const capitalState = { availableCapital: totalCapital };
@@ -527,7 +535,7 @@ async function main() {
         riskEngine.recordFundingRate(asset as any, snap.fundingRate);
 
         // Liquidity check
-        const liq = await liquidityGuard.checkLiquidity(asset as any, 10_000);
+        const liq = await liquidityGuard.checkLiquidity(asset, 10_000);
         if (!liq.allowed) {
           logger.warn(`${asset}: blocked by liquidity guard — ${liq.reason}`);
           continue;
@@ -539,15 +547,17 @@ async function main() {
         let signal = strategyEngine.evaluate(snap); // default signal
 
         if (currentState === "DELTA_NEUTRAL" || currentState === "BASIS_TRADE") {
-          // Update position's realized/unrealized PnL (reads from Drift user account)
+          // Update position's PnL (reads from Drift user account)
           execEngine.updatePositionPnL(asset, snap.fundingRate);
 
-          // Sync updated PnL back to the index.ts positions map so the summary displays it
-          const livePnL = execEngine.getOpenPositions().get(asset)?.unrealizedPnl ?? 0;
+          // Sync funding-collected (strategy yield) back to the positions map
+          // We use fundingCollected (not unrealizedPnl) to avoid MTM noise from price moves.
+          // In a perfectly delta-neutral position, spot MTM and perp MTM cancel — only funding remains.
+          const openPos = execEngine.getOpenPositions().get(asset);
+          const fundingYield = openPos?.fundingCollected ?? 0;
           const perpPos = positions.get(`${asset}_PERP`);
-          if (perpPos) perpPos.unrealizedPnl = livePnL;
-          const spotPos = positions.get(`${asset}_SPOT`);
-          if (spotPos) spotPos.unrealizedPnl = 0; // PnL lives in the perp leg
+          if (perpPos) perpPos.unrealizedPnl = fundingYield;
+          // Spot pnl already updated direction-correctly by the risk loop; leave it alone
 
           // Get entry funding rate from strategy engine
           const fundingExitEval = strategyEngine.shouldExitFundingBased(asset, snap.fundingRate);
@@ -765,19 +775,18 @@ async function main() {
           }
         }
 
-        // Update strategy state — driven by actual open positions, NOT just allocation ratios.
-        // This ensures a CLOSE signal's state reset isn't overwritten by a blanket setState call.
+        // Update strategy state — driven by actual open positions ONLY.
+        // Do NOT call setState when no position is open: setState("NONE"/"PARKED") wipes the
+        // momentum timer inside strategyEngine, preventing the 30s window from ever completing.
+        // Close signals already call setState("NONE") inline above; nothing else needs to.
         const hasOpenDeltaPos = positions.has(`${asset}_SPOT`) || positions.has(`${asset}_PERP`);
         if (hasOpenDeltaPos) {
           strategyEngine.setState(asset, "DELTA_NEUTRAL");
           currentStrategies[asset] = "DELTA_NEUTRAL";
-        } else if (allocation.delta > allocation.lending) {
-          // Allocation wants delta exposure but no position yet — stay NONE so engine can enter next cycle
-          strategyEngine.setState(asset, "NONE");
-          currentStrategies[asset] = "PARKED";
         } else {
-          strategyEngine.setState(asset, "PARKED");
-          currentStrategies[asset] = "LENDING";
+          // No position — leave engine state untouched so momentum keeps accumulating.
+          // currentStrategies is display-only.
+          currentStrategies[asset] = allocation.delta > allocation.lending ? "PARKED" : "LENDING";
         }
 
       }

@@ -23,3 +23,7 @@ Thumbs.db
 
 # TypeScript
 *.tsbuildinfo
+
+# Rust / Anchor build artifacts
+target/
+programs/delta_vault/target/

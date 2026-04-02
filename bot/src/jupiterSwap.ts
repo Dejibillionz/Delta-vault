@@ -70,11 +70,12 @@ export class JupiterSwapper {
   async swap(
     from: keyof typeof TOKEN_MINTS,
     to: keyof typeof TOKEN_MINTS,
-    amountUSD: number
+    amountUSD: number,
+    spotPrice?: number   // live price for the `from` token; falls back to MOCK_PRICES (devnet/offline only)
   ): Promise<SwapResult> {
     try {
       // Step 1: Get quote
-      const quote = await this.getQuote(from, to, amountUSD);
+      const quote = await this.getQuote(from, to, amountUSD, spotPrice);
       this.logger.info(
         `Jupiter Quote: ${from}→${to} | in=${quote.inputAmount} | out=${quote.outputAmount} | impact=${quote.priceImpactPct.toFixed(3)}%`
       );
@@ -166,14 +167,15 @@ export class JupiterSwapper {
   private async getQuote(
     from: keyof typeof TOKEN_MINTS,
     to: keyof typeof TOKEN_MINTS,
-    amountUSD: number
+    amountUSD: number,
+    spotPrice?: number   // live price for `from` token; overrides MOCK_PRICES
   ): Promise<SwapQuote> {
     const inputMint = TOKEN_MINTS[from];
     const outputMint = TOKEN_MINTS[to];
 
     // Convert USD amount to token amount using per-token decimals
     const decimals = TOKEN_DECIMALS[from] ?? 8;
-    const fromPrice = MOCK_PRICES[from] ?? 1;
+    const fromPrice = spotPrice ?? MOCK_PRICES[from] ?? 1;
     const inputTokens = amountUSD / fromPrice;
     const inputAmount = Math.floor(inputTokens * Math.pow(10, decimals));
 
