@@ -12,8 +12,20 @@ import { Logger } from "./logger";
 // Token mints on Solana mainnet
 const TOKEN_MINTS = {
   USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-  BTC: "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  // Wrapped BTC (Portal)
-  ETH: "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  // Wrapped ETH (Portal)
+  BTC:  "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  // Wrapped BTC (Portal)
+  ETH:  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  // Wrapped ETH (Portal)
+  SOL:  "So11111111111111111111111111111111111111112",     // Wrapped SOL (native)
+  JTO:  "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",  // JTO governance token
+};
+
+// Token decimals on Solana
+const TOKEN_DECIMALS: Record<string, number> = {
+  USDC: 6, BTC: 8, ETH: 8, SOL: 9, JTO: 9,
+};
+
+// Mock prices for devnet/offline testing
+const MOCK_PRICES: Record<string, number> = {
+  USDC: 1, BTC: 68500, ETH: 2150, SOL: 170, JTO: 4.0,
 };
 
 export interface SwapQuote {
@@ -51,8 +63,8 @@ export class JupiterSwapper {
 
   /**
    * Swap tokens via Jupiter
-   * @param from Token to sell ("USDC", "BTC", or "ETH")
-   * @param to Token to buy ("USDC", "BTC", or "ETH")
+   * @param from Token to sell ("USDC", "BTC", "ETH", "SOL", or "JTO")
+   * @param to Token to buy ("USDC", "BTC", "ETH", "SOL", or "JTO")
    * @param amount Amount in USD (always converted to from token)
    */
   async swap(
@@ -120,11 +132,10 @@ export class JupiterSwapper {
         const fakeTxSig = `MockTx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
         this.logger.info(`Jupiter offline mode: simulating ${from}→${to} swap with tx ${fakeTxSig}`);
 
-        const MOCK_PRICES: Record<string, number> = { USDC: 1, BTC: 68500, ETH: 2150 };
         const fromPrice = MOCK_PRICES[from] ?? 1;
         const toPrice = MOCK_PRICES[to] ?? 1;
-        const fromDecimals = from === "USDC" ? 6 : 8;
-        const toDecimals = to === "USDC" ? 6 : 8;
+        const fromDecimals = TOKEN_DECIMALS[from] ?? 8;
+        const toDecimals = TOKEN_DECIMALS[to] ?? 8;
 
         // amountUSD is in USD — convert to input token amount
         const inputTokens = amountUSD / fromPrice;  // e.g. $100 / $2150 = 0.0465 ETH
@@ -160,11 +171,10 @@ export class JupiterSwapper {
     const inputMint = TOKEN_MINTS[from];
     const outputMint = TOKEN_MINTS[to];
 
-    // Convert USD amount to token amount (use standard decimals: 6 for USDC, 8 for others)
-    const decimals = from === "USDC" ? 6 : 8;
-    const MOCK_PRICES: Record<string, number> = { USDC: 1, BTC: 68500, ETH: 2150 };
+    // Convert USD amount to token amount using per-token decimals
+    const decimals = TOKEN_DECIMALS[from] ?? 8;
     const fromPrice = MOCK_PRICES[from] ?? 1;
-    const inputTokens = amountUSD / fromPrice;  // e.g. $100 / $2150 = 0.0465 ETH
+    const inputTokens = amountUSD / fromPrice;
     const inputAmount = Math.floor(inputTokens * Math.pow(10, decimals));
 
     const params = {
@@ -200,7 +210,7 @@ export class JupiterSwapper {
 
         // Mock: convert between tokens using approximate prices, then apply 1% slippage
         const toPrice = MOCK_PRICES[to] ?? 1;
-        const toDecimals = to === "USDC" ? 6 : 8;
+        const toDecimals = TOKEN_DECIMALS[to] ?? 8;
 
         // amountUSD is already in USD — convert directly to output tokens
         const outputTokens = amountUSD / toPrice;

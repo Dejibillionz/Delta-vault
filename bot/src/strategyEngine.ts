@@ -34,7 +34,6 @@ export const THRESHOLDS = {
   MAX_POSITION_FRACTION: 0.4,
 } as const;
 
-// ─── Signal types ─────────────────────────────────────────────────────────────
 export type SignalType =
   | "DELTA_NEUTRAL_OPEN"
   | "DELTA_NEUTRAL_CLOSE"
@@ -44,7 +43,7 @@ export type SignalType =
   | "NO_ACTION";
 
 export interface Signal {
-  asset: "BTC" | "ETH";
+  asset: string;
   signal: SignalType;
   reason: string;
   urgency: "HIGH" | "MEDIUM" | "LOW";
@@ -58,23 +57,28 @@ export interface Signal {
   };
 }
 
+export type AssetStrategyState = "DELTA_NEUTRAL" | "BASIS_TRADE" | "PARKED" | "NONE";
+
+// Legacy interface kept for callers that destructure getState()
 export interface ActiveState {
-  BTC: "DELTA_NEUTRAL" | "BASIS_TRADE" | "PARKED" | "NONE";
-  ETH: "DELTA_NEUTRAL" | "BASIS_TRADE" | "PARKED" | "NONE";
+  [asset: string]: AssetStrategyState;
 }
+
+// Minimum ms funding must stay above threshold before entry (30s = 15 × 2s cycles)
+const MOMENTUM_WINDOW_MS = 30_000;
 
 // ─── Strategy Engine ──────────────────────────────────────────────────────────
 export class StrategyEngine {
   private logger: Logger;
-  private state: ActiveState = { BTC: "NONE", ETH: "NONE" };
-  private vaultEquity: number = 100_000; // updated externally
+  private state: Record<string, AssetStrategyState> = {};
+  private vaultEquity: number = 100_000;
   // Tracks the funding direction of the currently open delta-neutral position.
   // +1 = entered on positive funding (long spot / short perp)
   // -1 = entered on negative funding (short spot / long perp)
-  private fundingDir: Record<"BTC" | "ETH", 1 | -1> = { BTC: 1, ETH: 1 };
-
-  // Store entry funding rates for comparison with current rates
-  private entryFundingRate: Record<"BTC" | "ETH", number> = { BTC: 0, ETH: 0 };
+  private fundingDir: Record<string, 1 | -1> = {};
+  private entryFundingRate: Record<string, number> = {};
+  // Timestamp when funding first exceeded threshold (null = not yet/reset)
+  private fundingMomentumSince: Record<string, number | null> = {};
 
   constructor(logger: Logger) {
     this.logger = logger;
@@ -88,20 +92,23 @@ export class StrategyEngine {
     return { ...this.state };
   }
 
-  setState(asset: "BTC" | "ETH", val: ActiveState["BTC"]): void {
+  setState(asset: string, val: AssetStrategyState): void {
     this.state[asset] = val;
+    // Reset momentum when explicitly set to NONE/PARKED
+    if (val === "NONE" || val === "PARKED") {
+      this.fundingMomentumSince[asset] = null;
+    }
   }
 
   /**
    * Check if current funding rate warrants closing an open position
-   * Used by LiveExecutionEngine.evaluatePositionExit() for detailed checks
    */
   shouldExitFundingBased(
-    asset: "BTC" | "ETH",
+    asset: string,
     currentFundingRate: number
   ): { shouldClose: boolean; reason: string } {
-    const dir = this.fundingDir[asset];
-    const entryFR = this.entryFundingRate[asset];
+    const dir = this.fundingDir[asset] ?? 1;
+    const entryFR = this.entryFundingRate[asset] ?? 0;
     const effectiveFunding = currentFundingRate * dir;
 
     // Regime flipped
@@ -126,7 +133,7 @@ export class StrategyEngine {
   // ─── Evaluate market snapshot → emit signal ──────────────────────────────
   evaluate(snapshot: LiveMarketSnapshot): Signal {
     const { asset, fundingRate, basisSpread, liquidityScore, spotPrice, perpPrice } = snapshot;
-    const currentState = this.state[asset as keyof ActiveState];
+    const currentState = this.state[asset] ?? "NONE";
 
     const meta = { fundingRate, basisSpread, spotPrice, perpPrice, liquidityScore };
     const maxSize = this.vaultEquity * THRESHOLDS.MAX_POSITION_FRACTION;
@@ -134,8 +141,7 @@ export class StrategyEngine {
     // ── EXIT CONDITIONS ──────────────────────────────────────────────────────
 
     if (currentState === "DELTA_NEUTRAL") {
-      const dir = this.fundingDir[asset as "BTC" | "ETH"];
-      // effectiveFunding is the yield we are collecting — positive means we are still earning
+      const dir = this.fundingDir[asset] ?? 1;
       const effectiveFunding = fundingRate * dir;
       const regimeFlipped = effectiveFunding < -(THRESHOLDS.FUNDING_RATE_MIN * 2);
       if (regimeFlipped || effectiveFunding < THRESHOLDS.FUNDING_RATE_EXIT) {
@@ -143,14 +149,9 @@ export class StrategyEngine {
           ? `Funding regime flipped — reversing to ${dir < 0 ? "LONG spot + SHORT perp" : "SHORT spot + LONG perp"}`
           : `Effective funding ${pct(effectiveFunding)} fell below exit threshold — closing`;
         this.logger.info(`${asset} ${reason}`);
-        return {
-          asset,
-          signal: "DELTA_NEUTRAL_CLOSE",
-          reason,
-          urgency: regimeFlipped ? "HIGH" : "MEDIUM",
-          suggestedSizeUSD: 0,
-          metadata: meta,
-        };
+        // Reset momentum so re-entry requires a fresh 30s window
+        this.fundingMomentumSince[asset] = null;
+        return { asset, signal: "DELTA_NEUTRAL_CLOSE", reason, urgency: regimeFlipped ? "HIGH" : "MEDIUM", suggestedSizeUSD: 0, metadata: meta };
       }
     }
 
@@ -174,12 +175,32 @@ export class StrategyEngine {
         Math.abs(fundingRate) > THRESHOLDS.FUNDING_RATE_MIN &&
         liquidityScore >= THRESHOLDS.MIN_LIQUIDITY_SCORE
       ) {
-        this.fundingDir[asset as "BTC" | "ETH"] = fundingRate >= 0 ? 1 : -1;
-        this.entryFundingRate[asset as "BTC" | "ETH"] = fundingRate;
+        // ── Funding momentum filter: sustained signal for MOMENTUM_WINDOW_MS ──
+        const now = Date.now();
+        if (!this.fundingMomentumSince[asset]) {
+          this.fundingMomentumSince[asset] = now;
+        }
+        const elapsedMs = now - (this.fundingMomentumSince[asset] as number);
+
+        if (elapsedMs < MOMENTUM_WINDOW_MS) {
+          const remainS = Math.ceil((MOMENTUM_WINDOW_MS - elapsedMs) / 1000);
+          return {
+            asset,
+            signal: "NO_ACTION",
+            reason: `Funding momentum building — ${remainS}s remaining (need ${MOMENTUM_WINDOW_MS / 1000}s sustained)`,
+            urgency: "LOW",
+            suggestedSizeUSD: 0,
+            metadata: meta,
+          };
+        }
+
+        // Momentum confirmed — open position
+        this.fundingDir[asset] = fundingRate >= 0 ? 1 : -1;
+        this.entryFundingRate[asset] = fundingRate;
         const size = this.sizeDeltaNeutral(fundingRate, maxSize);
         const fundingDirection = fundingRate >= 0 ? "positive" : "negative";
         this.logger.trade(
-          `${asset} SIGNAL: DELTA_NEUTRAL_OPEN — ${fundingDirection} FR=${pct(fundingRate)}, size=$${size.toFixed(0)}`
+          `${asset} SIGNAL: DELTA_NEUTRAL_OPEN — ${fundingDirection} FR=${pct(fundingRate)}, size=$${size.toFixed(0)} (momentum confirmed ${Math.floor(elapsedMs / 1000)}s)`
         );
         return {
           asset,
@@ -191,6 +212,9 @@ export class StrategyEngine {
           suggestedSizeUSD: size,
           metadata: meta,
         };
+      } else {
+        // Funding dropped below threshold — reset momentum timer
+        this.fundingMomentumSince[asset] = null;
       }
 
       // 2. Basis trade: capture spread convergence

@@ -32,14 +32,18 @@ import { JupiterSwapper } from "./jupiterSwap";
 
 // ─── Market config ────────────────────────────────────────────────────────────
 export const PERP_MARKET = {
-  BTC: { index: 1, name: "BTC-PERP", tickSize: 0.1, minOrderSize: 0.001 },
-  ETH: { index: 2, name: "ETH-PERP", tickSize: 0.01, minOrderSize: 0.01 },
+  SOL: { index: 0,  name: "SOL-PERP", tickSize: 0.001, minOrderSize: 0.1  },
+  BTC: { index: 1,  name: "BTC-PERP", tickSize: 0.1,   minOrderSize: 0.001 },
+  ETH: { index: 2,  name: "ETH-PERP", tickSize: 0.01,  minOrderSize: 0.01  },
+  JTO: { index: 20, name: "JTO-PERP", tickSize: 0.001, minOrderSize: 1.0   },
 } as const;
 
 export const SPOT_MARKET = {
-  USDC: { index: 0, name: "USDC", decimals: 6 },
-  BTC:  { index: 1, name: "BTC-SPOT", decimals: 8 },
-  ETH:  { index: 2, name: "ETH-SPOT", decimals: 8 },
+  USDC: { index: 0, name: "USDC",     decimals: 6 },
+  SOL:  { index: 1, name: "SOL-SPOT", decimals: 9 },
+  BTC:  { index: 3, name: "BTC-SPOT", decimals: 8 },
+  ETH:  { index: 4, name: "ETH-SPOT", decimals: 8 },
+  JTO:  { index: 9, name: "JTO-SPOT", decimals: 9 },
 } as const;
 
 export type Asset = keyof typeof PERP_MARKET;
@@ -247,41 +251,20 @@ export class LiveExecutionEngine {
       if (!market) throw new Error(`No market data for ${asset}`);
 
       const markPrice = convertToNumber(market.amm.lastMarkPriceTwap, PRICE_PRECISION);
-
-      // Use exact spot quantity if available, otherwise fall back to USD / markPrice
       const baseAmount = exactBaseQty ?? (usdNotional / markPrice);
       const minSize = PERP_MARKET[asset].minOrderSize;
+      if (baseAmount < minSize) throw new Error(`Order too small: ${baseAmount.toFixed(6)} < min ${minSize}`);
 
-      if (baseAmount < minSize) {
-        throw new Error(`Order too small: ${baseAmount.toFixed(6)} < min ${minSize}`);
-      }
-
-      // Round to tick size
       const baseAmountBN = new BN(Math.floor(baseAmount * BASE_PRECISION.toNumber()));
-
-      const orderParams = getMarketOrderParams({
-        marketIndex: mi,
-        direction: PositionDirection.SHORT,
-        baseAssetAmount: baseAmountBN,
-        marketType: MarketType.PERP,
-        reduceOnly: false,
-      });
-
-      const txSig = await this.driftClient.placePerpOrder(orderParams);
-
-      // Confirm transaction
-      await this.connection.confirmTransaction(txSig, "confirmed");
+      const { txSig } = await this.placePerpOrderWithFallback("SHORT", asset, mi, baseAmountBN, markPrice);
 
       record.txSig = txSig;
       record.status = "FILLED";
       record.fillPrice = markPrice;
       record.baseQuantity = baseAmount;
 
-      if (exactBaseQty) {
-        this.logger.trade(`Drift SHORT ${asset} | qty=${baseAmount.toFixed(8)} (matched to spot) | driftPrice=${usd(markPrice)} | tx=${txSig}`);
-      } else {
-        this.logger.trade(`Drift SHORT ${asset} | qty=${baseAmount.toFixed(6)} | price=${usd(markPrice)} | tx=${txSig}`);
-      }
+      const tag = exactBaseQty ? `(matched to spot)` : "";
+      this.logger.trade(`Drift SHORT ${asset} | qty=${baseAmount.toFixed(8)} ${tag} | price=${usd(markPrice)} | tx=${txSig}`);
     } catch (err: any) {
       record.status = "FAILED";
       record.error = err.message;
@@ -303,38 +286,20 @@ export class LiveExecutionEngine {
       if (!market) throw new Error(`No market data for ${asset}`);
 
       const markPrice = convertToNumber(market.amm.lastMarkPriceTwap, PRICE_PRECISION);
-
-      // Use exact spot quantity if available, otherwise fall back to USD / markPrice
       const baseAmount = exactBaseQty ?? (usdNotional / markPrice);
       const minSize = PERP_MARKET[asset].minOrderSize;
-
-      if (baseAmount < minSize) {
-        throw new Error(`Order too small: ${baseAmount.toFixed(6)} < min ${minSize}`);
-      }
+      if (baseAmount < minSize) throw new Error(`Order too small: ${baseAmount.toFixed(6)} < min ${minSize}`);
 
       const baseAmountBN = new BN(Math.floor(baseAmount * BASE_PRECISION.toNumber()));
-
-      const orderParams = getMarketOrderParams({
-        marketIndex: mi,
-        direction: PositionDirection.LONG,
-        baseAssetAmount: baseAmountBN,
-        marketType: MarketType.PERP,
-        reduceOnly: false,
-      });
-
-      const txSig = await this.driftClient.placePerpOrder(orderParams);
-      await this.connection.confirmTransaction(txSig, "confirmed");
+      const { txSig } = await this.placePerpOrderWithFallback("LONG", asset, mi, baseAmountBN, markPrice);
 
       record.txSig = txSig;
       record.status = "FILLED";
       record.fillPrice = markPrice;
       record.baseQuantity = baseAmount;
 
-      if (exactBaseQty) {
-        this.logger.trade(`Drift LONG ${asset} | qty=${baseAmount.toFixed(8)} (matched to spot) | driftPrice=${usd(markPrice)} | tx=${txSig}`);
-      } else {
-        this.logger.trade(`Drift LONG ${asset} | qty=${baseAmount.toFixed(6)} | price=${usd(markPrice)} | tx=${txSig}`);
-      }
+      const tag = exactBaseQty ? `(matched to spot)` : "";
+      this.logger.trade(`Drift LONG ${asset} | qty=${baseAmount.toFixed(8)} ${tag} | price=${usd(markPrice)} | tx=${txSig}`);
     } catch (err: any) {
       record.status = "FAILED";
       record.error = err.message;
@@ -343,6 +308,76 @@ export class LiveExecutionEngine {
 
     this.orderLog.push(record);
     return record;
+  }
+
+  // ─── DRIFT: Limit order with 4s market-order fallback ───────────────────
+  // Posts a maker limit order; if unfilled after 4s, cancels and falls back to market.
+  // Using maker orders saves ~0.24% per round-trip (rebate vs taker fee).
+  private async placePerpOrderWithFallback(
+    side: "SHORT" | "LONG",
+    asset: Asset,
+    marketIndex: number,
+    baseAmountBN: BN,
+    markPrice: number
+  ): Promise<{ txSig: string; fillPrice: number }> {
+    const dir = side === "SHORT" ? PositionDirection.SHORT : PositionDirection.LONG;
+    // Maker limit: price slightly inside the spread so it posts (not crosses)
+    // SHORT: bid just below mark; LONG: ask just above mark
+    const limitBias = side === "SHORT" ? 0.9998 : 1.0002;
+    const limitPrice = new BN(Math.floor(markPrice * limitBias * PRICE_PRECISION.toNumber()));
+
+    const limitParams = getLimitOrderParams({
+      marketIndex,
+      direction: dir,
+      baseAssetAmount: baseAmountBN,
+      price: limitPrice,
+      postOnly: PostOnlyParams.MUST_POST_ONLY,
+      reduceOnly: false,
+      marketType: MarketType.PERP,
+    });
+
+    // Step 1: Place maker limit order
+    const limitTxSig = await this.driftClient.placePerpOrder(limitParams);
+    this.logger.trade(`${asset}: Maker limit ${side} placed — waiting up to 4s | tx=${limitTxSig}`);
+
+    // Step 2: Poll for fill up to 4s (8 × 500ms)
+    let limitFilled = false;
+    for (let i = 0; i < 8; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const user = this.driftClient.getUser();
+        const perpPos = user.getPerpPosition(marketIndex);
+        if (perpPos && !new BN(perpPos.baseAssetAmount).isZero()) {
+          limitFilled = true;
+          break;
+        }
+      } catch { /* continue polling */ }
+    }
+
+    if (limitFilled) {
+      this.logger.trade(`${asset}: Maker limit ${side} FILLED ✓ (saved ~0.12% taker fee)`);
+      return { txSig: limitTxSig, fillPrice: markPrice * limitBias };
+    }
+
+    // Step 3: Limit not filled — cancel and fall back to market order
+    this.logger.trade(`${asset}: Limit not filled in 4s — cancelling and placing market order`);
+    try {
+      await this.driftClient.cancelOrders(MarketType.PERP, marketIndex, undefined);
+    } catch (cancelErr: any) {
+      this.logger.warn(`${asset}: cancelOrders failed: ${cancelErr.message} — proceeding to market`);
+    }
+
+    const marketParams = getMarketOrderParams({
+      marketIndex,
+      direction: dir,
+      baseAssetAmount: baseAmountBN,
+      marketType: MarketType.PERP,
+      reduceOnly: false,
+    });
+    const marketTxSig = await this.driftClient.placePerpOrder(marketParams);
+    await this.connection.confirmTransaction(marketTxSig, "confirmed");
+    this.logger.trade(`${asset}: Market ${side} placed (fallback) | tx=${marketTxSig}`);
+    return { txSig: marketTxSig, fillPrice: markPrice };
   }
 
   // ─── DRIFT: Close perp position ──────────────────────────────────────────
@@ -394,8 +429,8 @@ export class LiveExecutionEngine {
 
   // ─── DRIFT SPOT: Swap tokens via Drift spot markets ─────────────────────────
   private async jupiterSpotSwap(
-    from: "USDC" | "BTC" | "ETH",
-    to: "USDC" | "BTC" | "ETH",
+    from: "USDC" | "BTC" | "ETH" | "SOL" | "JTO",
+    to: "USDC" | "BTC" | "ETH" | "SOL" | "JTO",
     usdAmount: number
   ): Promise<OrderRecord> {
     const side = from === "USDC" ? "BUY" : "SELL";
@@ -409,7 +444,7 @@ export class LiveExecutionEngine {
       // Calculate actual base quantity (the non-USDC token amount)
       // When buying (USDC→BTC): base qty = output (BTC received)
       // When selling (ETH→USDC): base qty = input (ETH sold)
-      const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8 };
+      const DECIMALS: Record<string, number> = { USDC: 6, BTC: 8, ETH: 8, SOL: 9, JTO: 9 };
       const isBuying = from === "USDC";
       const baseToken = isBuying ? to : from;
       const baseDecimals = DECIMALS[baseToken];

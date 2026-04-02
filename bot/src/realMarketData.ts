@@ -24,19 +24,27 @@ import { debugLog } from "./logging";
 export const PYTH_FEED_IDS = {
   BTC: "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
   ETH: "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+  SOL: "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+  JTO: "0xb43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2",
 } as const;
 
-// Pyth Solana mainnet price account pubkeys
-const PYTH_PRICE_ACCOUNTS = {
+// Pyth Solana mainnet price account pubkeys (used for WS subscriptions)
+const PYTH_PRICE_ACCOUNTS: Record<string, PublicKey> = {
   BTC: new PublicKey("GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU"),
   ETH: new PublicKey("JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB"),
-} as const;
+  SOL: new PublicKey("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"),
+};
 
 // Drift perp market indices
-export const DRIFT_MARKET_INDEX = { BTC: 1, ETH: 2 } as const;
+export const DRIFT_MARKET_INDEX: Record<string, number> = {
+  SOL: 0, BTC: 1, ETH: 2, JTO: 20,
+};
+
+// Assets tracked by this engine (matches PERP_MARKET keys)
+const TRACKED_ASSETS = ["BTC", "ETH", "SOL", "JTO"];
 
 export interface LiveMarketSnapshot {
-  asset: "BTC" | "ETH";
+  asset: string;
   timestamp: number;
   // Prices
   spotPrice: number;           // Pyth oracle
@@ -65,7 +73,7 @@ export class RealMarketDataEngine {
   private connection: Connection;
   private pythClient!: PythHttpClient;
   private logger: Logger;
-  private store: Record<"BTC" | "ETH", LiveMarketSnapshot | null> = { BTC: null, ETH: null };
+  private store: Record<string, LiveMarketSnapshot | null> = {};
   private callbacks: SnapshotCallback[] = [];
   private pollTimer: NodeJS.Timeout | null = null;
   private heliusWs: WebSocket | null = null;
@@ -76,6 +84,9 @@ export class RealMarketDataEngine {
     this.connection = connection;
     this.logger = logger;
     this.network = network;
+
+    // Initialise store for all tracked assets
+    for (const a of TRACKED_ASSETS) this.store[a] = null;
 
     // Pyth HTTP client — use the correct cluster based on network
     const pythCluster = network === "mainnet-beta" ? "mainnet-beta" : "devnet";
@@ -104,25 +115,26 @@ export class RealMarketDataEngine {
   }
 
   onUpdate(cb: SnapshotCallback): void { this.callbacks.push(cb); }
-  getSnapshot(asset: "BTC" | "ETH"): LiveMarketSnapshot | null { return this.store[asset]; }
+  getSnapshot(asset: string): LiveMarketSnapshot | null { return this.store[asset] ?? null; }
 
   // ─── Fetch all assets ───────────────────────────────────────────────────
   private async refreshAll(): Promise<void> {
-    // Fetch Pyth prices in one batch call
     const pythData = await this.fetchPythPrices();
     await Promise.all(
-      (["BTC", "ETH"] as const).map(a => this.refreshAsset(a, pythData[a]))
+      TRACKED_ASSETS.map(a => this.refreshAsset(a, pythData[a] ?? { price: 0, confidence: 0 }))
     );
   }
 
   // ─── Fetch Pyth prices via Hermes REST API ──────────────────────────────
-  private async fetchPythPrices(): Promise<Record<"BTC" | "ETH", { price: number; confidence: number }>> {
+  private async fetchPythPrices(): Promise<Record<string, { price: number; confidence: number }>> {
+    const defaultResult: Record<string, { price: number; confidence: number }> =
+      Object.fromEntries(TRACKED_ASSETS.map(a => [a, { price: 0, confidence: 0 }]));
     try {
       const ids = Object.values(PYTH_FEED_IDS).join("&ids[]=");
       const url = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${ids}`;
       const res = await axios.get(url, { timeout: 8000 });
 
-      const result: Record<string, { price: number; confidence: number }> = { BTC: { price: 0, confidence: 0 }, ETH: { price: 0, confidence: 0 } };
+      const result: Record<string, { price: number; confidence: number }> = { ...defaultResult };
 
       for (const parsed of res.data.parsed ?? []) {
         const asset = Object.entries(PYTH_FEED_IDS).find(([, id]) => id === "0x" + parsed.id)?.[0];
@@ -134,20 +146,21 @@ export class RealMarketDataEngine {
         };
       }
 
-      return result as any;
+      return result;
     } catch (err: any) {
       this.logger.warn(`Pyth Hermes fetch failed: ${err.message} — falling back to Drift oracle`);
-      return { BTC: { price: 0, confidence: 0 }, ETH: { price: 0, confidence: 0 } };
+      return defaultResult;
     }
   }
 
   // ─── Refresh a single asset ─────────────────────────────────────────────
   private async refreshAsset(
-    asset: "BTC" | "ETH",
+    asset: string,
     pyth: { price: number; confidence: number }
   ): Promise<void> {
     try {
       const mi = DRIFT_MARKET_INDEX[asset];
+      if (mi === undefined) { this.logger.warn(`No Drift market index for ${asset}`); return; }
       const market = this.driftClient.getPerpMarketAccount(mi);
       if (!market) throw new Error(`No Drift market data for ${asset}`);
 
