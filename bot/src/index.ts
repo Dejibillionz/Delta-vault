@@ -120,6 +120,10 @@ async function main() {
   const liquidityGuard = new LiquidityGuard(driftClient, logger);
   const execEngine     = new LiveExecutionEngine(driftClient, connection, wallet, logger);
   const anchorClient   = new AnchorVaultClient(connection, wallet, logger);
+  await anchorClient.checkDeployed(); // silently disables on-chain sync if program not yet deployed
+  // Initialize vault PDA on-chain if this is the first run
+  const usdcMint = new PublicKey(process.env.USDC_MINT ?? "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+  await anchorClient.initializeVaultIfNeeded(usdcMint);
 
   // ── Fetch live USDC balance from Drift account ─────────────────────────────
   // Retry up to 5×2s: handles RPC jitter and WebSocket hydration lag after subscribe()

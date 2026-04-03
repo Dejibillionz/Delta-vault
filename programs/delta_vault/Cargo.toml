@@ -14,7 +14,13 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
-anchor-lang = "0.29.0"
-anchor-spl = "0.29.0"
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = "0.31.1"
+# Force older transitive deps that compile with BPF rustc 1.79 / Cargo 1.79
+# blake3 1.8+ uses edition2024 (needs Cargo 1.85); 1.5.5 satisfies all >=1.5.5 requirements
+blake3 = { version = "=1.5.5", features = ["traits-preview"] }
+# indexmap 2.6+ raised MSRV to 1.82; 2.5.0 is the highest Rust-1.79-compatible 2.x
+indexmap = { version = "=2.5.0", features = ["std"] }
