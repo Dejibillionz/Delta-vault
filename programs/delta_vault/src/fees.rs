@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use crate::vault::VaultState;
 
 const SECONDS_PER_YEAR: u64 = 365 * 24 * 3_600;
@@ -49,13 +49,14 @@ pub struct CollectFees<'info> {
     #[account(mut, constraint = fee_collector_shares.mint == vault_state.share_mint)]
     pub fee_collector_shares: Account<'info, TokenAccount>,
     #[account(mut, constraint = share_mint.key() == vault_state.share_mint)]
-    pub share_mint: anchor_spl::token::Account,
+    pub share_mint: Account<'info, Mint>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
 pub fn collect(ctx: Context<CollectFees>, fee_collector: Pubkey) -> Result<()> {
+    let vault_state_info = ctx.accounts.vault_state.to_account_info();
     let vault     = &mut ctx.accounts.vault_state;
     let fee_state = &mut ctx.accounts.fee_state;
     let clock     = Clock::get()?;
@@ -130,7 +131,7 @@ pub fn collect(ctx: Context<CollectFees>, fee_collector: Pubkey) -> Result<()> {
             Transfer {
                 from:      ctx.accounts.vault_usdc.to_account_info(),
                 to:        ctx.accounts.fee_collector_usdc.to_account_info(),
-                authority: ctx.accounts.vault_state.to_account_info(),
+                authority: vault_state_info.clone(),
             }, signer), mgmt_fee)?;
         vault.usdc_balance = vault.usdc_balance.saturating_sub(mgmt_fee);
         fee_state.total_mgmt_fees += mgmt_fee;
@@ -145,7 +146,7 @@ pub fn collect(ctx: Context<CollectFees>, fee_collector: Pubkey) -> Result<()> {
             anchor_spl::token::MintTo {
                 mint:      ctx.accounts.share_mint.to_account_info(),
                 to:        ctx.accounts.fee_collector_shares.to_account_info(),
-                authority: ctx.accounts.vault_state.to_account_info(),
+                authority: vault_state_info.clone(),
             }, signer), fee_shares_to_mint)?;
         vault.total_shares = vault.total_shares
             .checked_add(fee_shares_to_mint)

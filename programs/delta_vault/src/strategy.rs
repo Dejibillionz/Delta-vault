@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use crate::vault::VaultState;
-use crate::risk::{AssertRisk, assert_ok, RiskError};
+use crate::risk::{AssertRisk, assert_ok, RiskError, RiskOracle};
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq)]
 pub enum StrategyMode {
@@ -49,7 +49,7 @@ pub struct UpdateStrategy<'info> {
         bump,
         constraint = risk_oracle.vault == vault_state.key() @ RiskError::InvalidOracle
     )]
-    pub risk_oracle: crate::risk::RiskOracle,
+    pub risk_oracle: Account<'info, RiskOracle>,
 
     #[account(
         mut,
@@ -121,12 +121,13 @@ pub struct ProposeRotation<'info> {
 }
 
 pub fn propose_bot_rotation(ctx: Context<ProposeRotation>, new_bot: Pubkey) -> Result<()> {
+    let vault_key = ctx.accounts.vault_state.key();
     let vault = &mut ctx.accounts.vault_state;
     let clock = Clock::get()?;
     vault.pending_bot             = new_bot;
     vault.rotation_effective_time = clock.unix_timestamp + 86_400; // 24hr timelock
     emit!(BotRotationProposed {
-        vault: ctx.accounts.vault_state.key(),
+        vault: vault_key,
         pending_bot: new_bot,
         effective_time: vault.rotation_effective_time,
     });
@@ -144,6 +145,7 @@ pub struct ExecuteRotation<'info> {
 }
 
 pub fn execute_bot_rotation(ctx: Context<ExecuteRotation>) -> Result<()> {
+    let vault_key = ctx.accounts.vault_state.key();
     let vault = &mut ctx.accounts.vault_state;
     let clock = Clock::get()?;
     require!(vault.pending_bot != Pubkey::default(), StrategyError::NoPendingRotation);
@@ -156,7 +158,7 @@ pub fn execute_bot_rotation(ctx: Context<ExecuteRotation>) -> Result<()> {
     vault.pending_bot             = Pubkey::default();
     vault.rotation_effective_time = 0;
     emit!(BotRotationExecuted {
-        vault: ctx.accounts.vault_state.key(),
+        vault: vault_key,
         old_bot,
         new_bot: vault.authorized_bot,
     });

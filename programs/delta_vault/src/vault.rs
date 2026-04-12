@@ -155,6 +155,7 @@ pub struct InitializeVault<'info> {
 }
 
 pub fn initialize(ctx: Context<InitializeVault>, params: VaultParams) -> Result<()> {
+    let vault_key = ctx.accounts.vault_state.key();
     let vault = &mut ctx.accounts.vault_state;
     let clock = Clock::get()?;
     vault.authority              = ctx.accounts.authority.key();
@@ -175,7 +176,7 @@ pub fn initialize(ctx: Context<InitializeVault>, params: VaultParams) -> Result<
     vault.rotation_effective_time = 0;
     vault.params                 = params;
     vault.bump                   = ctx.bumps.vault_state;
-    emit!(VaultInitialized { vault: ctx.accounts.vault_state.key(), authority: vault.authority });
+    emit!(VaultInitialized { vault: vault_key, authority: vault.authority });
     Ok(())
 }
 
@@ -198,6 +199,7 @@ pub fn update_nav(
     spot_btc: u64,
     spot_eth: u64,
 ) -> Result<()> {
+    let vault_key = ctx.accounts.vault_state.key();
     let vault = &mut ctx.accounts.vault_state;
     let clock = Clock::get()?;
     vault.perp_unrealized_pnl = perp_pnl;
@@ -208,7 +210,7 @@ pub fn update_nav(
     vault.cached_nav_per_share = nav_ps;
     if nav_ps > vault.peak_nav_per_share { vault.peak_nav_per_share = nav_ps; }
     if nav_ps > vault.high_water_mark    { vault.high_water_mark    = nav_ps; }
-    emit!(NavUpdated { vault: ctx.accounts.vault_state.key(), nav_per_share: nav_ps, timestamp: clock.unix_timestamp });
+    emit!(NavUpdated { vault: vault_key, nav_per_share: nav_ps, timestamp: clock.unix_timestamp });
     Ok(())
 }
 
@@ -230,6 +232,7 @@ pub struct Deposit<'info> {
 }
 
 pub fn deposit(ctx: Context<Deposit>, amount_usdc: u64) -> Result<()> {
+    let vault_state_info = ctx.accounts.vault_state.to_account_info();
     let vault = &mut ctx.accounts.vault_state;
     let clock = Clock::get()?;
     require!(amount_usdc >= vault.params.min_deposit_usdc, VaultError::BelowMinDeposit);
@@ -257,7 +260,7 @@ pub fn deposit(ctx: Context<Deposit>, amount_usdc: u64) -> Result<()> {
     let mint_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(),
         anchor_spl::token::MintTo { mint: ctx.accounts.share_mint.to_account_info(),
             to: ctx.accounts.depositor_shares.to_account_info(),
-            authority: ctx.accounts.vault_state.to_account_info() }, signer);
+            authority: vault_state_info.clone() }, signer);
     anchor_spl::token::mint_to(mint_ctx, shares_to_mint)?;
     vault.usdc_balance = vault.usdc_balance.checked_add(amount_usdc).ok_or(VaultError::MathOverflow)?;
     vault.total_shares = vault.total_shares.checked_add(shares_to_mint).ok_or(VaultError::MathOverflow)?;
@@ -282,6 +285,7 @@ pub struct Withdraw<'info> {
 }
 
 pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
+    let vault_state_info = ctx.accounts.vault_state.to_account_info();
     let vault = &mut ctx.accounts.vault_state;
     let clock = Clock::get()?;
     require!(shares > 0, VaultError::ZeroAmount);
@@ -301,11 +305,11 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
     anchor_spl::token::burn(CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(),
         anchor_spl::token::Burn { mint: ctx.accounts.share_mint.to_account_info(),
             from: ctx.accounts.withdrawer_shares.to_account_info(),
-            authority: ctx.accounts.vault_state.to_account_info() }, signer), shares)?;
+            authority: vault_state_info.clone() }, signer), shares)?;
     token::transfer(CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(),
         Transfer { from: ctx.accounts.vault_usdc.to_account_info(),
             to: ctx.accounts.withdrawer_usdc.to_account_info(),
-            authority: ctx.accounts.vault_state.to_account_info() }, signer), usdc_to_return)?;
+            authority: vault_state_info.clone() }, signer), usdc_to_return)?;
     vault.usdc_balance = vault.usdc_balance.saturating_sub(usdc_to_return);
     vault.total_shares = vault.total_shares.checked_sub(shares).ok_or(VaultError::MathOverflow)?;
     emit!(WithdrawEvent { withdrawer: ctx.accounts.withdrawer.key(), shares_burned: shares, usdc_returned: usdc_to_return, nav_per_share: vault.cached_nav_per_share });

@@ -1,124 +1,1261 @@
 {
-  "version": "0.1.0",
-  "name": "delta_vault",
+  "address": "2g9eqiJXmGkJARi7Sgmk3U5Fy7KRdAwPonuMeYyouAEr",
+  "metadata": {
+    "name": "delta_vault",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Adaptive Delta-Neutral Vault — Solana on-chain program"
+  },
+  "docs": [
+    "Delta Vault — Adaptive Delta-Neutral Strategy",
+    "",
+    "Architecture (per security review):",
+    "",
+    "TRUST MODEL: This is a \"trusted bot\" model. The on-chain program",
+    "validates state but cannot prevent the bot from temporarily creating",
+    "exposed states between spot fill and perp hedge — true atomicity",
+    "across Jupiter + Drift is not possible with current Solana program",
+    "structure. For production with >$1M TVL, formal verification of vault.rs",
+    "math and an Immunefi bug bounty are recommended.",
+    "",
+    "SECURITY IMPROVEMENTS (from audit):",
+    "- NAV confidence buffer (0.5% haircut on volatile spot positions)",
+    "- NAV staleness guard on deposit/withdraw",
+    "- Peak NAV tracking for accurate drawdown computation",
+    "- Pre-trade risk checks embedded in update_strategy",
+    "- 24hr timelock for bot key rotation",
+    "- Share-minting pattern for performance fees",
+    "- Epoch-gated fee collection (MEV-resistant)",
+    "- risk_oracle is a proper PDA (not unchecked AccountInfo)"
+  ],
   "instructions": [
     {
-      "name": "updateNav",
-      "accounts": [
-        { "name": "vaultState", "isMut": true,  "isSigner": false },
-        { "name": "bot",        "isMut": false, "isSigner": true  }
+      "name": "assert_risk_ok",
+      "docs": [
+        "Standalone risk check — reverts if any limit is breached."
       ],
-      "args": [
-        { "name": "btcPriceUsdc", "type": "u64" },
-        { "name": "ethPriceUsdc", "type": "u64" },
-        { "name": "perpPnl",      "type": "i64" },
-        { "name": "spotBtc",      "type": "u64" },
-        { "name": "spotEth",      "type": "u64" }
-      ]
-    },
-    {
-      "name": "updateRiskOracle",
-      "accounts": [
-        { "name": "riskOracle",    "isMut": true,  "isSigner": false },
-        { "name": "vaultState",    "isMut": false, "isSigner": false },
-        { "name": "bot",           "isMut": false, "isSigner": true  },
-        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      "discriminator": [
+        76,
+        159,
+        229,
+        250,
+        119,
+        74,
+        199,
+        88
       ],
-      "args": [
-        { "name": "drawdownBps",      "type": "u16" },
-        { "name": "deltaBps",         "type": "u16" },
-        { "name": "executionPaused",  "type": "u8"  }
-      ]
-    },
-    {
-      "name": "updateStrategy",
       "accounts": [
-        { "name": "vaultState",    "isMut": false, "isSigner": false },
-        { "name": "strategyState", "isMut": true,  "isSigner": false },
-        { "name": "riskOracle",    "isMut": false, "isSigner": false },
-        { "name": "bot",           "isMut": false, "isSigner": true  },
-        { "name": "systemProgram", "isMut": false, "isSigner": false }
-      ],
-      "args": [
-        { "name": "mode", "type": { "defined": "StrategyMode" } }
-      ]
-    },
-    {
-      "name": "assertRiskOk",
-      "accounts": [
-        { "name": "vaultState", "isMut": false, "isSigner": false },
-        { "name": "riskOracle", "isMut": false, "isSigner": false }
+        {
+          "name": "vault_state"
+        },
+        {
+          "name": "risk_oracle",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  105,
+                  115,
+                  107,
+                  95,
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        }
       ],
       "args": []
     },
     {
-      "name": "initializeVault",
+      "name": "cancel_bot_rotation",
+      "docs": [
+        "Cancel a pending rotation (emergency)."
+      ],
+      "discriminator": [
+        45,
+        218,
+        95,
+        81,
+        194,
+        78,
+        241,
+        1
+      ],
       "accounts": [
-        { "name": "vaultState",    "isMut": true,  "isSigner": false },
-        { "name": "authority",     "isMut": true,  "isSigner": true  },
-        { "name": "systemProgram", "isMut": false, "isSigner": false }
+        {
+          "name": "vault_state",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "collect_fees",
+      "docs": [
+        "Collect management + performance fees. Epoch-gated (max once per day).",
+        "Performance fees minted as shares (not USDC transfer)."
+      ],
+      "discriminator": [
+        164,
+        152,
+        207,
+        99,
+        30,
+        186,
+        19,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "vault_state",
+          "writable": true
+        },
+        {
+          "name": "fee_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true
+        },
+        {
+          "name": "fee_collector_usdc",
+          "writable": true
+        },
+        {
+          "name": "fee_collector_shares",
+          "writable": true
+        },
+        {
+          "name": "share_mint",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
       ],
       "args": [
-        { "name": "params", "type": { "defined": "VaultParams" } }
+        {
+          "name": "fee_collector",
+          "type": "pubkey"
+        }
       ]
     },
     {
       "name": "deposit",
+      "discriminator": [
+        242,
+        35,
+        198,
+        137,
+        82,
+        225,
+        242,
+        182
+      ],
       "accounts": [
-        { "name": "vaultState",    "isMut": true,  "isSigner": false },
-        { "name": "depositor",     "isMut": true,  "isSigner": true  },
-        { "name": "systemProgram", "isMut": false, "isSigner": false }
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.authority",
+                "account": "VaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "depositor_usdc",
+          "writable": true
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true
+        },
+        {
+          "name": "depositor_shares",
+          "writable": true
+        },
+        {
+          "name": "share_mint",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
       ],
       "args": [
-        { "name": "amountUsdc", "type": "u64" }
+        {
+          "name": "amount_usdc",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "execute_bot_rotation",
+      "docs": [
+        "Execute rotation after 24hr timelock has elapsed."
+      ],
+      "discriminator": [
+        202,
+        81,
+        201,
+        174,
+        47,
+        120,
+        154,
+        127
+      ],
+      "accounts": [
+        {
+          "name": "vault_state",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize_vault",
+      "discriminator": [
+        48,
+        191,
+        163,
+        44,
+        71,
+        129,
+        63,
+        164
+      ],
+      "accounts": [
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "share_mint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  104,
+                  97,
+                  114,
+                  101,
+                  95,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "VaultParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "propose_bot_rotation",
+      "docs": [
+        "Propose new bot key — starts 24hr timelock."
+      ],
+      "discriminator": [
+        58,
+        93,
+        32,
+        138,
+        126,
+        62,
+        23,
+        1
+      ],
+      "accounts": [
+        {
+          "name": "vault_state",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "new_bot",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "update_nav",
+      "docs": [
+        "Bot calls this each strategy cycle to push fresh NAV on-chain.",
+        "Must be called before deposit/withdraw if NAV is stale."
+      ],
+      "discriminator": [
+        56,
+        16,
+        234,
+        109,
+        155,
+        165,
+        5,
+        0
+      ],
+      "accounts": [
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.authority",
+                "account": "VaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bot",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "btc_price_usdc",
+          "type": "u64"
+        },
+        {
+          "name": "eth_price_usdc",
+          "type": "u64"
+        },
+        {
+          "name": "perp_pnl",
+          "type": "i64"
+        },
+        {
+          "name": "spot_btc",
+          "type": "u64"
+        },
+        {
+          "name": "spot_eth",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "update_risk_oracle",
+      "docs": [
+        "Bot writes drawdown/delta/pause state each cycle."
+      ],
+      "discriminator": [
+        36,
+        54,
+        14,
+        44,
+        216,
+        239,
+        132,
+        80
+      ],
+      "accounts": [
+        {
+          "name": "risk_oracle",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  105,
+                  115,
+                  107,
+                  95,
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_state"
+        },
+        {
+          "name": "bot",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "drawdown_bps",
+          "type": "u16"
+        },
+        {
+          "name": "delta_bps",
+          "type": "u16"
+        },
+        {
+          "name": "execution_paused",
+          "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "update_strategy",
+      "docs": [
+        "Update strategy mode — includes pre-trade risk check inline."
+      ],
+      "discriminator": [
+        16,
+        76,
+        138,
+        179,
+        171,
+        112,
+        196,
+        21
+      ],
+      "accounts": [
+        {
+          "name": "vault_state",
+          "writable": true
+        },
+        {
+          "name": "strategy_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  116,
+                  114,
+                  97,
+                  116,
+                  101,
+                  103,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "risk_oracle",
+          "docs": [
+            "Risk oracle — checked inline before strategy update"
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  105,
+                  115,
+                  107,
+                  95,
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bot",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "mode",
+          "type": {
+            "defined": {
+              "name": "StrategyMode"
+            }
+          }
+        }
       ]
     },
     {
       "name": "withdraw",
+      "discriminator": [
+        183,
+        18,
+        70,
+        156,
+        148,
+        109,
+        161,
+        34
+      ],
       "accounts": [
-        { "name": "vaultState",    "isMut": true,  "isSigner": false },
-        { "name": "depositor",     "isMut": true,  "isSigner": true  },
-        { "name": "systemProgram", "isMut": false, "isSigner": false }
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.authority",
+                "account": "VaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "withdrawer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "withdrawer_shares",
+          "writable": true
+        },
+        {
+          "name": "withdrawer_usdc",
+          "writable": true
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true
+        },
+        {
+          "name": "share_mint",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
       ],
       "args": [
-        { "name": "shares", "type": "u64" }
-      ]
-    },
-    {
-      "name": "collectFees",
-      "accounts": [
-        { "name": "vaultState",    "isMut": true,  "isSigner": false },
-        { "name": "bot",           "isMut": false, "isSigner": true  },
-        { "name": "systemProgram", "isMut": false, "isSigner": false }
-      ],
-      "args": [
-        { "name": "feeCollector", "type": "publicKey" }
+        {
+          "name": "shares",
+          "type": "u64"
+        }
       ]
     }
   ],
   "accounts": [
     {
+      "name": "FeeState",
+      "discriminator": [
+        63,
+        224,
+        16,
+        85,
+        193,
+        36,
+        235,
+        220
+      ]
+    },
+    {
+      "name": "RiskOracle",
+      "discriminator": [
+        195,
+        55,
+        195,
+        227,
+        68,
+        47,
+        75,
+        151
+      ]
+    },
+    {
+      "name": "StrategyState",
+      "discriminator": [
+        83,
+        18,
+        224,
+        109,
+        174,
+        100,
+        39,
+        139
+      ]
+    },
+    {
       "name": "VaultState",
+      "discriminator": [
+        228,
+        196,
+        82,
+        165,
+        98,
+        210,
+        235,
+        152
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "BotRotationCancelled",
+      "discriminator": [
+        219,
+        209,
+        132,
+        193,
+        1,
+        53,
+        62,
+        109
+      ]
+    },
+    {
+      "name": "BotRotationExecuted",
+      "discriminator": [
+        179,
+        137,
+        255,
+        245,
+        190,
+        189,
+        64,
+        145
+      ]
+    },
+    {
+      "name": "BotRotationProposed",
+      "discriminator": [
+        218,
+        202,
+        106,
+        82,
+        241,
+        194,
+        18,
+        138
+      ]
+    },
+    {
+      "name": "DepositEvent",
+      "discriminator": [
+        120,
+        248,
+        61,
+        83,
+        31,
+        142,
+        107,
+        144
+      ]
+    },
+    {
+      "name": "FeesCollected",
+      "discriminator": [
+        233,
+        23,
+        117,
+        225,
+        107,
+        178,
+        254,
+        8
+      ]
+    },
+    {
+      "name": "NavUpdated",
+      "discriminator": [
+        182,
+        153,
+        142,
+        26,
+        205,
+        24,
+        110,
+        154
+      ]
+    },
+    {
+      "name": "RiskAlert",
+      "discriminator": [
+        249,
+        197,
+        60,
+        65,
+        30,
+        77,
+        229,
+        57
+      ]
+    },
+    {
+      "name": "RiskOracleUpdated",
+      "discriminator": [
+        100,
+        108,
+        57,
+        164,
+        160,
+        17,
+        58,
+        64
+      ]
+    },
+    {
+      "name": "StrategyUpdated",
+      "discriminator": [
+        103,
+        50,
+        233,
+        252,
+        65,
+        157,
+        43,
+        94
+      ]
+    },
+    {
+      "name": "VaultInitialized",
+      "discriminator": [
+        180,
+        43,
+        207,
+        2,
+        18,
+        71,
+        3,
+        75
+      ]
+    },
+    {
+      "name": "WithdrawEvent",
+      "discriminator": [
+        22,
+        9,
+        133,
+        26,
+        160,
+        44,
+        71,
+        192
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "BelowMinDeposit",
+      "msg": "Deposit below minimum"
+    },
+    {
+      "code": 6001,
+      "name": "ZeroAmount",
+      "msg": "Amount must be > 0"
+    },
+    {
+      "code": 6002,
+      "name": "ZeroShares",
+      "msg": "Shares calculated as zero"
+    },
+    {
+      "code": 6003,
+      "name": "InsufficientShares",
+      "msg": "Insufficient shares"
+    },
+    {
+      "code": 6004,
+      "name": "NoShares",
+      "msg": "No shares in circulation"
+    },
+    {
+      "code": 6005,
+      "name": "InsufficientLiquidity",
+      "msg": "Insufficient vault liquidity"
+    },
+    {
+      "code": 6006,
+      "name": "MathOverflow",
+      "msg": "Math overflow"
+    },
+    {
+      "code": 6007,
+      "name": "StaleNAV",
+      "msg": "NAV cache is stale — bot must update"
+    },
+    {
+      "code": 6008,
+      "name": "Unauthorized",
+      "msg": "Unauthorized caller"
+    }
+  ],
+  "types": [
+    {
+      "name": "BotRotationCancelled",
       "type": {
         "kind": "struct",
         "fields": [
-          { "name": "authority",    "type": "publicKey" },
-          { "name": "nav",          "type": "u64"       },
-          { "name": "navUpdatedAt", "type": "i64"       },
-          { "name": "totalShares",  "type": "u64"       },
-          { "name": "bot",          "type": "publicKey" }
+          {
+            "name": "vault",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BotRotationExecuted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_bot",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_bot",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BotRotationProposed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_bot",
+            "type": "pubkey"
+          },
+          {
+            "name": "effective_time",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DepositEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_usdc",
+            "type": "u64"
+          },
+          {
+            "name": "shares_minted",
+            "type": "u64"
+          },
+          {
+            "name": "nav_per_share",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeState",
+      "docs": [
+        "Fee accrual state per vault.",
+        "",
+        "Audit improvements:",
+        "1. Fees are accrued continuously (time-weighted) and collected on",
+        "scheduled epochs OR on withdrawal — not permissionlessly crankable",
+        "by MEV bots at any time.",
+        "2. Performance fee uses share-minting pattern (not direct USDC transfer)",
+        "so fee collector participates in future NAV alongside depositors.",
+        "3. last_fee_accrual timestamp prevents double-collection.",
+        "4. collect_fees is restricted to authority OR triggered on withdrawal",
+        "(epoch-gated, defined by fee_epoch_s param)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_collector",
+            "type": "pubkey"
+          },
+          {
+            "name": "last_fee_accrual",
+            "type": "i64"
+          },
+          {
+            "name": "fee_epoch_s",
+            "type": "i64"
+          },
+          {
+            "name": "total_mgmt_fees",
+            "type": "u64"
+          },
+          {
+            "name": "total_perf_fees",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeesCollected",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "mgmt_fee_usdc",
+            "type": "u64"
+          },
+          {
+            "name": "perf_fee_shares",
+            "type": "u64"
+          },
+          {
+            "name": "perf_fee_usdc_equiv",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "NavUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "nav_per_share",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RiskAlert",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "reason",
+            "type": "string"
+          },
+          {
+            "name": "severity",
+            "type": "u16"
+          }
         ]
       }
     },
     {
       "name": "RiskOracle",
+      "docs": [
+        "On-chain risk guardrails.",
+        "",
+        "Audit findings addressed:",
+        "1. assert_risk_ok is now also called as a pre/post check on every trade",
+        "instruction via the require_risk_ok! macro pattern.",
+        "2. Delta exposure is approximated on-chain from stored spot/perp positions.",
+        "3. Drawdown is computed from vault.peak_nav_per_share (persisted in state).",
+        "4. Oracle freshness uses Pyth publish_time directly.",
+        "",
+        "Honest limitation (per audit): True atomicity across Jupiter+Drift is",
+        "impossible. The bot can create a temporarily exposed state between",
+        "spot fill and perp hedge. assert_risk_ok enforces state checks but",
+        "cannot prevent intra-cycle exposure gaps."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
-          { "name": "vault",            "type": "publicKey" },
-          { "name": "drawdownBps",      "type": "u16"       },
-          { "name": "deltaBps",         "type": "u16"       },
-          { "name": "executionPaused",  "type": "u8"        }
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "drawdown_bps",
+            "docs": [
+              "Drawdown in basis points — written by bot each cycle"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "delta_bps",
+            "docs": [
+              "Net delta exposure in bps of NAV — written by bot"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "execution_paused",
+            "docs": [
+              "1 = bot has paused execution (congestion, stale oracle, etc.)"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "last_updated",
+            "docs": [
+              "Unix timestamp of last oracle update"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RiskOracleUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "drawdown_bps",
+            "type": "u16"
+          },
+          {
+            "name": "delta_bps",
+            "type": "u16"
+          },
+          {
+            "name": "execution_paused",
+            "type": "u8"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "StrategyMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "DeltaNeutral"
+          },
+          {
+            "name": "BasisTrade"
+          },
+          {
+            "name": "ParkCapital"
+          },
+          {
+            "name": "EmergencyStop"
+          }
         ]
       }
     },
@@ -127,22 +1264,84 @@
       "type": {
         "kind": "struct",
         "fields": [
-          { "name": "vault", "type": "publicKey"                    },
-          { "name": "mode",  "type": { "defined": "StrategyMode" } }
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "current_mode",
+            "type": {
+              "defined": {
+                "name": "StrategyMode"
+              }
+            }
+          },
+          {
+            "name": "last_updated",
+            "type": "i64"
+          },
+          {
+            "name": "authorized_bot",
+            "type": "pubkey"
+          },
+          {
+            "name": "btc_perp_position",
+            "docs": [
+              "Net BTC perp position in base units (negative = short)"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "eth_perp_position",
+            "docs": [
+              "Net ETH perp position in base units (negative = short)"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
         ]
       }
-    }
-  ],
-  "types": [
+    },
     {
-      "name": "StrategyMode",
+      "name": "StrategyUpdated",
       "type": {
-        "kind": "enum",
-        "variants": [
-          { "name": "DeltaNeutral"  },
-          { "name": "BasisTrade"    },
-          { "name": "ParkCapital"   },
-          { "name": "EmergencyStop" }
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "bot",
+            "type": "pubkey"
+          },
+          {
+            "name": "mode",
+            "type": "string"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultInitialized",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
+          }
         ]
       }
     },
@@ -151,13 +1350,187 @@
       "type": {
         "kind": "struct",
         "fields": [
-          { "name": "managementFeeBps",  "type": "u16" },
-          { "name": "performanceFeeBps", "type": "u16" }
+          {
+            "name": "management_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "performance_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "max_drawdown_bps",
+            "type": "u16"
+          },
+          {
+            "name": "max_delta_bps",
+            "type": "u16"
+          },
+          {
+            "name": "min_deposit_usdc",
+            "type": "u64"
+          },
+          {
+            "name": "nav_confidence_buffer_bps",
+            "docs": [
+              "Confidence haircut on volatile spot positions (bps).",
+              "Audit note: prevents oracle-manipulation mints by applying",
+              "a small discount: adjusted_price = price * (10000 - buffer) / 10000"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "max_nav_staleness_s",
+            "docs": [
+              "Max age of cached NAV before deposit/withdraw rejected (seconds)"
+            ],
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultState",
+      "docs": [
+        "Vault state account — stores all configuration and current NAV.",
+        "",
+        "Architecture note (from security review):",
+        "NAV has three moving parts: USDC balance, spot asset values, perp PnL.",
+        "All three must be reflected before any deposit/withdraw.",
+        "We cache NAV per share (updated by bot) and enforce staleness on user txns."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "usdc_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "share_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "usdc_balance",
+            "docs": [
+              "USDC held in vault escrow (6 decimals)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "spot_btc_amount",
+            "docs": [
+              "Spot BTC held (8 decimals, e.g. 100_000_000 = 1 BTC)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "spot_eth_amount",
+            "docs": [
+              "Spot ETH held (8 decimals)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "perp_unrealized_pnl",
+            "docs": [
+              "Unrealized perp PnL — signed USDC (6 dec). Negative = loss."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "borrowed_usdc",
+            "docs": [
+              "USDC borrowed for leverage (0 if none)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "cached_nav_per_share",
+            "docs": [
+              "Cached NAV per share (scaled 1e6). $1.00 = 1_000_000."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "nav_last_updated",
+            "docs": [
+              "Unix timestamp of last NAV update"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "peak_nav_per_share",
+            "docs": [
+              "All-time peak NAV per share (for drawdown calculation)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_shares",
+            "type": "u64"
+          },
+          {
+            "name": "high_water_mark",
+            "docs": [
+              "HWM for performance fee (NAV per share, scaled 1e6)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "authorized_bot",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_bot",
+            "type": "pubkey"
+          },
+          {
+            "name": "rotation_effective_time",
+            "type": "i64"
+          },
+          {
+            "name": "params",
+            "type": {
+              "defined": {
+                "name": "VaultParams"
+              }
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "withdrawer",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_burned",
+            "type": "u64"
+          },
+          {
+            "name": "usdc_returned",
+            "type": "u64"
+          },
+          {
+            "name": "nav_per_share",
+            "type": "u64"
+          }
         ]
       }
     }
-  ],
-  "metadata": {
-    "address": "2g9eqiJXmGkJARi7Sgmk3U5Fy7KRdAwPonuMeYyouAEr"
-  }
+  ]
 }

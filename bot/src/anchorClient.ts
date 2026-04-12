@@ -11,6 +11,7 @@ import {
   Connection,
   PublicKey,
   SystemProgram,
+  SYSVAR_RENT_PUBKEY,
 } from "@solana/web3.js";
 import {
   AnchorProvider,
@@ -65,6 +66,13 @@ export function findFeesPda(vault: PublicKey, programId: PublicKey): [PublicKey,
   );
 }
 
+export function findShareMintPda(vault: PublicKey, programId: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("share_mint"), vault.toBuffer()],
+    programId
+  );
+}
+
 // ── Anchor Client ─────────────────────────────────────────────────────────────
 export class AnchorVaultClient {
   private program: Program | null = null;
@@ -108,19 +116,76 @@ export class AnchorVaultClient {
       return;
     }
 
-    // Anchor 0.29.x: Program(idl, programId, provider)
-    this.program     = new Program(idl, this.programId, this.provider);
+    // anchor 0.31.x: Program(idl, provider) — programId comes from idl.address.
+    // Override idl.address with VAULT_PROGRAM_ID env var if provided.
+    const idlWithAddr = { ...idl, address: this.programId.toBase58() } as Idl;
+    this.program     = new Program(idlWithAddr, this.provider);
     this.isAvailable = true;
     this.logger.info(
       `AnchorClient ready — program: ${this.programId.toBase58()}\n` +
       `  vault PDA:       ${this.vaultPda.toBase58()}\n` +
-      `  risk oracle PDA: ${this.riskOraclePda.toBase58()}`
+      `  risk oracle PDA: ${this.riskOraclePda.toBase58()}\n` +
+      `  NOTE: vault must be initialized on-chain before updateNav will succeed`
     );
   }
 
   ready(): boolean {
     if (process.env.DEMO_MODE === "true") return false; // no SOL in demo — skip on-chain
     return this.isAvailable && this.program !== null;
+  }
+
+  // ── async startup check — call once after construction ─────────────────────
+  // Verifies the program is deployed; disables on-chain sync silently if not.
+  async checkDeployed(): Promise<void> {
+    if (!this.isAvailable) return;
+    try {
+      const info = await this.provider.connection.getAccountInfo(this.programId);
+      if (!info) {
+        this.logger.warn(
+          `AnchorClient: program ${this.programId.toBase58()} not found on-chain — on-chain NAV sync disabled.\n` +
+          `  Deploy with: anchor deploy --provider.cluster devnet`
+        );
+        this.isAvailable = false;
+      }
+    } catch { /* keep isAvailable as-is on RPC error */ }
+  }
+
+  // ── Initialize vault if it doesn't exist yet ────────────────────────────────
+  // Call once on startup after checkDeployed(). Safe to call repeatedly —
+  // no-ops if vault PDA already exists.
+  async initializeVaultIfNeeded(usdcMint: PublicKey): Promise<void> {
+    if (!this.ready()) return;
+    const existing = await this.getVaultState();
+    if (existing) {
+      this.logger.info(`AnchorClient: vault already initialized at ${this.vaultPda.toBase58()}`);
+      return;
+    }
+    try {
+      const [shareMintPda] = findShareMintPda(this.vaultPda, this.programId);
+      const txSig = await this.program!.methods
+        .initializeVault({
+          managementFeeBps: 200,
+          performanceFeeBps: 2000,
+          maxDrawdownBps: 1000,
+          maxDeltaBps: 500,
+          minDepositUsdc: new BN(10_000_000),
+          navConfidenceBufferBps: 50,
+          maxNavStalenessS: new BN(120),
+        })
+        .accounts({
+          vaultState:    this.vaultPda,
+          authority:     this.provider.wallet.publicKey,
+          usdcMint,
+          shareMint:     shareMintPda,
+          systemProgram: SystemProgram.programId,
+          tokenProgram:  TOKEN_PROGRAM_ID,
+          rent:          SYSVAR_RENT_PUBKEY,
+        })
+        .rpc();
+      this.logger.info(`initializeVault tx: ${txSig}`);
+    } catch (err: any) {
+      this.logger.error(`initializeVault failed: ${err.message}`);
+    }
   }
 
   // ── update_nav ──────────────────────────────────────────────────────────────
