@@ -104,7 +104,8 @@ export class TelegramAlerts {
     });
   }
 
-  async tradeOpened(asset: string, type: string, sizeUsd: number, txSig?: string): Promise<void> {
+  async tradeOpened(asset: string, type: string, sizeUsd: number, legDesc?: string, txSig?: string): Promise<void> {
+    const legs = legDesc ?? "LONG spot (Jupiter) + SHORT perp (Hyperliquid)";
     await this.send({
       level: "TRADE",
       title: `${asset} ${type} Position Opened`,
@@ -112,7 +113,7 @@ export class TelegramAlerts {
         `Asset:  ${asset}`,
         `Type:   ${type}`,
         `Size:   $${sizeUsd.toLocaleString("en-US", { maximumFractionDigits: 0 })}`,
-        `Legs:   Spot long (Drift) + Perp short (Drift)`,
+        `Legs:   ${legs}`,
       ].join("\n"),
       txSig,
     });

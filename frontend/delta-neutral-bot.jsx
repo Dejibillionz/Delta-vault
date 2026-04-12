@@ -238,7 +238,7 @@ export default function DeltaVault() {
         setRiskFlags(flags);
         return updated;
       });
-      addLog("INFO", `Cycle #${tick + 1} — Drift funding scanned`);
+      addLog("INFO", `Cycle #${tick + 1} — Hyperliquid funding scanned`);
     }, 2500);
     return () => clearInterval(id);
   }, [running, addLog, tick]);
@@ -292,7 +292,7 @@ export default function DeltaVault() {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, paddingBottom: 13, borderBottom: "1px solid #16202e" }}>
           <div>
             <div style={{ fontSize: 18, fontWeight: 700, color: "#00ffa3", letterSpacing: 2.5, fontFamily: "'Space Grotesk',sans-serif" }}>◈ DELTA VAULT</div>
-            <div style={{ fontSize: 8, color: "#2a3a4a", letterSpacing: 3, marginTop: 2 }}>DRIFT PROTOCOL · SOLANA MAINNET · BTC + ETH · DELTA-NEUTRAL</div>
+            <div style={{ fontSize: 8, color: "#2a3a4a", letterSpacing: 3, marginTop: 2 }}>HYPERLIQUID · KAMINO · SOLANA · BTC/ETH/SOL/JTO · DELTA-NEUTRAL</div>
           </div>
           <div style={{ display: "flex", gap: 9, alignItems: "center" }}>
             {!wallet.connected ? (
@@ -315,7 +315,7 @@ export default function DeltaVault() {
               <span className={running ? "blink" : ""} style={{ width: 6, height: 6, borderRadius: "50%", background: running ? "#00ffa3" : "#2a3040", display: "inline-block" }} />
               {running ? "LIVE" : "IDLE"}
             </div>
-            <button className="btn" onClick={() => { setRunning(r => !r); addLog("SYS", running ? "Bot stopped by operator" : "Bot started — scanning Drift funding rates"); }}
+            <button className="btn" onClick={() => { setRunning(r => !r); addLog("SYS", running ? "Bot stopped by operator" : "Bot started — scanning Hyperliquid funding rates"); }}
               style={{ background: running ? "#120707" : "#071207", color: running ? "#f87171" : "#00ffa3", border: `1px solid ${running ? "#f8717155" : "#00ffa355"}` }}>
               {running ? "⏹ STOP BOT" : "▶ START BOT"}
             </button>
@@ -381,7 +381,7 @@ export default function DeltaVault() {
               </div>
             ))}
             <div style={{ fontSize: 8, color: "#2a3540", marginTop: 6, padding: "5px 8px", background: "#060910", borderRadius: 5 }}>
-              Funding rates: Drift Protocol AMM · Spot prices: Pyth Network Hermes API · Basis: computed (perp−spot)/spot
+              Funding rates: Hyperliquid REST API · Spot prices: Pyth Network Hermes API · Basis: computed (perp−spot)/spot
             </div>
           </div>
 
@@ -408,10 +408,10 @@ export default function DeltaVault() {
             <div style={{ padding: "9px 11px", background: "#060910", borderRadius: 6, border: "1px solid #141e2c" }}>
               <div style={{ fontSize: 8, color: "#7dd3fc", letterSpacing: 1, marginBottom: 5 }}>STRATEGY PSEUDOCODE</div>
               <code style={{ fontSize: 8, color: "#6a7a8a", lineHeight: 1.9 }}>
-                scan_drift_funding_rates(BTC, ETH)<br/>
+                scan_hyperliquid_funding_rates(BTC, ETH, SOL, JTO)<br/>
                 if funding_rate {">"} 0.01%/hr:<br/>
                 {"  "}jupiter_buy_spot(asset, size)<br/>
-                {"  "}drift_short_perp(asset, size)<br/>
+                {"  "}hyperliquid_short_perp(asset, size)<br/>
                 elif basis_spread {">"} 1.0%:<br/>
                 {"  "}execute_basis_trade(asset)<br/>
                 else:<br/>
@@ -426,10 +426,10 @@ export default function DeltaVault() {
 
           {/* ③ Execution Engine */}
           <div className="card">
-            <div style={{ fontSize: 8, color: "#f59e0b", letterSpacing: 2, fontWeight: 700, marginBottom: 10 }}>③ EXECUTION ENGINE // DRIFT + JUPITER // SOLANA</div>
+            <div style={{ fontSize: 8, color: "#f59e0b", letterSpacing: 2, fontWeight: 700, marginBottom: 10 }}>③ EXECUTION ENGINE // HYPERLIQUID + JUPITER // SOLANA</div>
             <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
               {[
-                { l: "PERP DEX",  v: "Drift v2",    c: "#f59e0b" },
+                { l: "PERP DEX",  v: "Hyperliquid",    c: "#f59e0b" },
                 { l: "SPOT",      v: "Jupiter v6",  c: "#00ffa3" },
                 { l: "RPC",       v: "Helius",       c: "#7dd3fc" },
                 { l: "WALLET",    v: wallet.connected ? short(wallet.address) : "Not connected", c: wallet.connected ? "#a78bfa" : "#445" },
@@ -522,7 +522,7 @@ export default function DeltaVault() {
         </div>
 
         <div style={{ marginTop: 12, textAlign: "center", fontSize: 7.5, color: "#141e2a", letterSpacing: 2 }}>
-          DELTA VAULT · SIMULATION MODE · DRIFT PROTOCOL · SOLANA · BTC + ETH · NOT FINANCIAL ADVICE
+          DELTA VAULT · SIMULATION MODE · HYPERLIQUID · KAMINO · SOLANA · BTC/ETH/SOL/JTO · NOT FINANCIAL ADVICE
         </div>
       </div>
     </div>

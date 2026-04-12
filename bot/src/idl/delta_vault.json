@@ -1,0 +1,163 @@
+{
+  "version": "0.1.0",
+  "name": "delta_vault",
+  "instructions": [
+    {
+      "name": "updateNav",
+      "accounts": [
+        { "name": "vaultState", "isMut": true,  "isSigner": false },
+        { "name": "bot",        "isMut": false, "isSigner": true  }
+      ],
+      "args": [
+        { "name": "btcPriceUsdc", "type": "u64" },
+        { "name": "ethPriceUsdc", "type": "u64" },
+        { "name": "perpPnl",      "type": "i64" },
+        { "name": "spotBtc",      "type": "u64" },
+        { "name": "spotEth",      "type": "u64" }
+      ]
+    },
+    {
+      "name": "updateRiskOracle",
+      "accounts": [
+        { "name": "riskOracle",    "isMut": true,  "isSigner": false },
+        { "name": "vaultState",    "isMut": false, "isSigner": false },
+        { "name": "bot",           "isMut": false, "isSigner": true  },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "drawdownBps",      "type": "u16" },
+        { "name": "deltaBps",         "type": "u16" },
+        { "name": "executionPaused",  "type": "u8"  }
+      ]
+    },
+    {
+      "name": "updateStrategy",
+      "accounts": [
+        { "name": "vaultState",    "isMut": false, "isSigner": false },
+        { "name": "strategyState", "isMut": true,  "isSigner": false },
+        { "name": "riskOracle",    "isMut": false, "isSigner": false },
+        { "name": "bot",           "isMut": false, "isSigner": true  },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "mode", "type": { "defined": "StrategyMode" } }
+      ]
+    },
+    {
+      "name": "assertRiskOk",
+      "accounts": [
+        { "name": "vaultState", "isMut": false, "isSigner": false },
+        { "name": "riskOracle", "isMut": false, "isSigner": false }
+      ],
+      "args": []
+    },
+    {
+      "name": "initializeVault",
+      "accounts": [
+        { "name": "vaultState",    "isMut": true,  "isSigner": false },
+        { "name": "authority",     "isMut": true,  "isSigner": true  },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "params", "type": { "defined": "VaultParams" } }
+      ]
+    },
+    {
+      "name": "deposit",
+      "accounts": [
+        { "name": "vaultState",    "isMut": true,  "isSigner": false },
+        { "name": "depositor",     "isMut": true,  "isSigner": true  },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "amountUsdc", "type": "u64" }
+      ]
+    },
+    {
+      "name": "withdraw",
+      "accounts": [
+        { "name": "vaultState",    "isMut": true,  "isSigner": false },
+        { "name": "depositor",     "isMut": true,  "isSigner": true  },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "shares", "type": "u64" }
+      ]
+    },
+    {
+      "name": "collectFees",
+      "accounts": [
+        { "name": "vaultState",    "isMut": true,  "isSigner": false },
+        { "name": "bot",           "isMut": false, "isSigner": true  },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "feeCollector", "type": "publicKey" }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "VaultState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "authority",    "type": "publicKey" },
+          { "name": "nav",          "type": "u64"       },
+          { "name": "navUpdatedAt", "type": "i64"       },
+          { "name": "totalShares",  "type": "u64"       },
+          { "name": "bot",          "type": "publicKey" }
+        ]
+      }
+    },
+    {
+      "name": "RiskOracle",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "vault",            "type": "publicKey" },
+          { "name": "drawdownBps",      "type": "u16"       },
+          { "name": "deltaBps",         "type": "u16"       },
+          { "name": "executionPaused",  "type": "u8"        }
+        ]
+      }
+    },
+    {
+      "name": "StrategyState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "vault", "type": "publicKey"                    },
+          { "name": "mode",  "type": { "defined": "StrategyMode" } }
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "StrategyMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          { "name": "DeltaNeutral"  },
+          { "name": "BasisTrade"    },
+          { "name": "ParkCapital"   },
+          { "name": "EmergencyStop" }
+        ]
+      }
+    },
+    {
+      "name": "VaultParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "managementFeeBps",  "type": "u16" },
+          { "name": "performanceFeeBps", "type": "u16" }
+        ]
+      }
+    }
+  ],
+  "metadata": {
+    "address": "2g9eqiJXmGkJARi7Sgmk3U5Fy7KRdAwPonuMeYyouAEr"
+  }
+}

@@ -15,8 +15,16 @@
  *     - Oracle staleness > 30s         → HALT_NEW_POSITIONS
  */
 
-import { PositionInfo } from "./executionEngine";
 import { Logger } from "./logger";
+
+// Minimal position shape used by the risk engine
+export interface PositionInfo {
+  asset: string;
+  quoteAmount: number;
+  direction: "LONG" | "SHORT";
+  unrealizedPnl: number;
+  [key: string]: any;
+}
 
 // ─── Risk limits ──────────────────────────────────────────────────────────────
 export const RISK_LIMITS = {
@@ -29,7 +37,8 @@ export const RISK_LIMITS = {
 
   // New: market conditions
   MAX_FUNDING_VOLATILITY:  0.20,   // Relative funding jump > 0.2 = chaotic
-  MAX_SOLANA_LATENCY_MS:   500,    // RPC round-trip > 500ms = congested
+  MAX_SOLANA_LATENCY_MS:   500,    // Solana RPC > 500ms = warn (Kamino/Anchor may be slow)
+  MAX_HL_LATENCY_MS:       2000,   // Hyperliquid API > 2s = pause execution
   MAX_ORACLE_STALENESS_S:  30,     // Pyth price age > 30s = stale
 
   // Position sizing reduction when conditions are adverse
@@ -53,13 +62,14 @@ export interface RiskEvent {
   action: RiskAction;
   severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
   message: string;
-  asset?: "BTC" | "ETH";
+  asset?: string;
   timestamp: number;
 }
 
 export interface MarketConditions {
   fundingRateVolatility: number;  // std dev / mean of recent funding rates
-  solanaLatencyMs: number;        // RPC ping in ms
+  solanaRpcLatencyMs: number;     // Solana RPC ping — only affects Kamino/Anchor txs
+  hlLatencyMs: number;            // Hyperliquid API round-trip — gates perp order placement
   oracleStalenessS: number;       // Seconds since last Pyth price update
 }
 
@@ -83,8 +93,8 @@ export class EnhancedRiskEngine {
   private highWaterMark: number;
   private haltNewTrades: boolean = false;
   private pauseExecution: boolean = false;
-  private recentFundingRates: Record<string, number[]> = { BTC: [], ETH: [] };
-  private smoothedFunding: Record<string, number> = { BTC: 0, ETH: 0 };
+  private recentFundingRates: Record<string, number[]> = {};
+  private smoothedFunding: Record<string, number> = {};
   private fundingSizeReduced: boolean = false;
 
   constructor(initialEquity: number, logger: Logger) {
@@ -156,7 +166,7 @@ export class EnhancedRiskEngine {
       if (lossPct > RISK_LIMITS.MAX_SINGLE_ASSET_LOSS) {
         this.logEvent(events, "CLOSE_POSITION", "HIGH",
           `${pos.asset} position loss ${pct(lossPct)} > ${pct(RISK_LIMITS.MAX_SINGLE_ASSET_LOSS)}`,
-          pos.asset as any);
+          pos.asset);
       }
     }
 
@@ -186,14 +196,20 @@ export class EnhancedRiskEngine {
       );
     }
 
-    // ── CHECK 6 (NEW): Solana network congestion ─────────────────────────────
-    if (conditions.solanaLatencyMs > RISK_LIMITS.MAX_SOLANA_LATENCY_MS) {
+    // ── CHECK 6 (NEW): Network congestion ───────────────────────────────────
+    // HL API latency gates order placement (perps live on HL, not Solana).
+    // Solana RPC slowness only affects Kamino/Anchor — logged as WARNING only.
+    if (conditions.hlLatencyMs > RISK_LIMITS.MAX_HL_LATENCY_MS) {
       this.pauseExecution = true;
       this.logEvent(events, "PAUSE_EXECUTION", "HIGH",
-        `Solana RPC latency ${conditions.solanaLatencyMs}ms > ${RISK_LIMITS.MAX_SOLANA_LATENCY_MS}ms — pausing execution`);
-    } else if (this.pauseExecution && conditions.solanaLatencyMs < RISK_LIMITS.MAX_SOLANA_LATENCY_MS * 0.7) {
+        `Hyperliquid API latency ${conditions.hlLatencyMs}ms > ${RISK_LIMITS.MAX_HL_LATENCY_MS}ms — pausing HL order placement`);
+    } else if (this.pauseExecution && conditions.hlLatencyMs < RISK_LIMITS.MAX_HL_LATENCY_MS * 0.7) {
       this.pauseExecution = false;
-      this.logger.info("RiskEngine: Network congestion cleared — execution resumed");
+      this.logger.info("RiskEngine: Hyperliquid API latency recovered — execution resumed");
+    }
+    if (conditions.solanaRpcLatencyMs > RISK_LIMITS.MAX_SOLANA_LATENCY_MS) {
+      this.logEvent(events, "WARNING", "MEDIUM",
+        `Solana RPC latency ${conditions.solanaRpcLatencyMs}ms — Kamino/Anchor txs may be slow`);
     }
 
     // ── CHECK 7 (NEW): Oracle staleness ─────────────────────────────────────
@@ -215,6 +231,10 @@ export class EnhancedRiskEngine {
     if (events.length === 0) {
       events.push({ action: "NORMAL", severity: "INFO", message: "All risk checks passed", timestamp: Date.now() });
     }
+
+    // Step 2: sync sizingMultiplier with halt/pause flags so PortfolioMetrics is consistent
+    // with getSizingMultiplier() which already returns 0 on halt/pause.
+    if (this.haltNewTrades || this.pauseExecution) sizingMultiplier = 0;
 
     return {
       navUSD: currentEquity,
@@ -270,7 +290,7 @@ export class EnhancedRiskEngine {
     action: RiskAction,
     severity: RiskEvent["severity"],
     message: string,
-    asset?: "BTC" | "ETH"
+    asset?: string
   ): void {
     events.push({ action, severity, message, asset, timestamp: Date.now() });
     const logFn = severity === "CRITICAL" || severity === "HIGH"

@@ -12,11 +12,11 @@ export interface CostBreakdown {
 
 const ROUTE_MULTIPLIER: Record<string, number> = {
   "solana->arbitrum": 1.00,
-  "solana->base": 0.95,
+  "solana->base":     0.95,
   "solana->optimism": 0.98,
-  "solana->polygon": 1.05,
-  "solana->avalanche": 1.08,
-  "solana->bnb": 1.12,
+  "solana->polygon":  1.05,
+  "solana->avalanche":1.08,
+  "solana->bnb":      1.12,
 };
 
 export function estimateCosts({
@@ -28,20 +28,13 @@ export function estimateCosts({
   fromChain?: string;
   toChain?: string;
 }): CostBreakdown {
-  const routeKey = `${fromChain ?? "solana"}->${toChain ?? "arbitrum"}`;
+  const routeKey   = `${fromChain ?? "solana"}->${toChain ?? "arbitrum"}`;
   const routeFactor = ROUTE_MULTIPLIER[routeKey] ?? 1.0;
 
   // Base assumptions (tunable): bridge 0.30%, gas 0.10%, slippage 0.15%
   const bridgeCost = amount * 0.003 * routeFactor;
-  const gasCost = amount * 0.001 * routeFactor;
-  const slippage = amount * 0.0015 * routeFactor;
+  const gasCost    = amount * 0.001 * routeFactor;
+  const slippage   = amount * 0.0015 * routeFactor;
 
-  const totalCost = bridgeCost + gasCost + slippage;
-
-  return {
-    bridgeCost,
-    gasCost,
-    slippage,
-    totalCost,
-  };
+  return { bridgeCost, gasCost, slippage, totalCost: bridgeCost + gasCost + slippage };
 }

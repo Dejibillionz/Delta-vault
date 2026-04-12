@@ -1,6 +1,6 @@
 # ◈ Delta Vault — Adaptive Delta-Neutral Vault Strategy
 
-> Drift Protocol · Solana · BTC + ETH · Mainnet-Ready
+> Hyperliquid · Kamino · MarginFi · Solana · BTC + ETH + SOL + JTO · Mainnet-Ready
 
 A production-ready delta-neutral vault strategy that generates stable yield through funding rate arbitrage, basis spread capture, cross-chain opportunity routing, and adaptive capital allocation — with zero directional price exposure.
 
@@ -10,12 +10,12 @@ A production-ready delta-neutral vault strategy that generates stable yield thro
 
 | Mode | Trigger | Action | Yield Source |
 |------|---------|--------|--------------|
-| **DELTA_NEUTRAL** | \|Funding rate\| > 0.01%/hr (mainnet) | Long spot (Jupiter) + short perp (Drift) | Funding payments |
+| **DELTA_NEUTRAL** | \|Funding rate\| > 0.01%/hr (mainnet) | Long spot (Jupiter) + short perp (Hyperliquid) | Funding payments |
 | **BASIS_TRADE** | Basis spread > 1.0% (mainnet) | Buy spot + short futures | Spread convergence |
-| **PARK_CAPITAL** | No opportunity | Deploy leftover to Drift lending pool | Lending APY |
+| **PARK_CAPITAL** | No opportunity | Deploy leftover to Kamino Finance (USDC lending) | Lending APY |
 | **CROSS_CHAIN** | Better net edge on another chain (devnet only) | Bridge capital to best venue | Inter-venue funding arb |
 
-**Bidirectional funding:** Positive funding → LONG spot + SHORT perp. Negative funding → SHORT spot + LONG perp.
+**Bidirectional funding:** Positive funding → LONG spot + SHORT perp. Negative funding → SHORT spot (via MarginFi borrow) + LONG perp.
 **Historical Opportunity Range:** 8–25% APY (market-dependent)
 **Max Drawdown:** 10% hard stop
 **Net Delta:** ~0 (market-neutral)
@@ -37,14 +37,15 @@ A production-ready delta-neutral vault strategy that generates stable yield thro
 │ Market │ │Strategy│ │  Risk    │ │Execution│ │ Cross-Chain  │
 │  Data  │ │ Engine │ │  Engine  │ │ Engine  │ │  Decision    │
 │        │ │        │ │          │ │         │ │              │
-│Pyth +  │ │Signals │ │Drawdown  │ │Jupiter  │ │7-chain scan  │
-│Helius  │ │Sizing  │ │Vol debounce│spot swap│ │Fee-adj edge  │
-│        │ │Carryover│ │Warm-up  │ │Drift    │ │Cost model    │
+│Hyper-  │ │Signals │ │Drawdown  │ │Jupiter  │ │7-chain scan  │
+│liquid  │ │Sizing  │ │Vol debounce│spot swap│ │Fee-adj edge  │
+│        │ │Carryover│ │Warm-up  │ │Hyper-   │ │Cost model    │
+│        │ │        │ │          │ │liquid   │ │              │
 │        │ │        │ │          │ │perp     │ │              │
 └────────┘ └────────┘ └──────────┘ └─────────┘ └──────────────┘
 ```
 
-**Strategy loop:** Every 30 seconds
+**Strategy loop:** Every 15 seconds (logs every 2 cycles ≈ 30s)
 **Risk loop:** Every 10 seconds
 **State API:** `http://localhost:3001` (polled by dashboard every 5s)
 
@@ -52,14 +53,14 @@ A production-ready delta-neutral vault strategy that generates stable yield thro
 
 ## Execution Flow — True Delta-Neutral
 
-The bot uses **two separate DEXs** for the two legs of a delta-neutral position:
+The bot uses **three DeFi protocols** to construct a fully delta-neutral position:
 
-| Leg | DEX | Method | Why |
-|-----|-----|--------|-----|
-| **Spot LONG** | Jupiter Aggregator | HTTP API swap (USDC → BTC/ETH) | No minimum order size — works with any vault size |
-| **Perp SHORT** | Drift Protocol | `placePerpOrder()` market order | Native Solana perp DEX with funding rate collection |
-
-Drift spot markets require ~1 BTC minimum ($68k+), which is impractical for smaller vaults. Jupiter has no minimums, so the bot routes spot through Jupiter and perps through Drift.
+| Leg | Protocol | Method | Why |
+|-----|----------|--------|-----|
+| **Spot LONG** | Jupiter Aggregator | HTTP API swap (USDC → asset) | Best-price routing, no minimum order size |
+| **Perp SHORT** | Hyperliquid | EIP-712 signed REST order | Deep perpetuals market with funding payments |
+| **Lending yield** | Kamino Finance | USDC supply-side deposit | Earns ~4.5% APY on idle capital |
+| **Negative-funding borrow** | MarginFi | Borrow asset → sell on Jupiter | Synthetic short for negative-funding regime |
 
 ### Position Closing
 
@@ -74,7 +75,7 @@ Positions are closed when any of these conditions are met:
 | Funding depleted | Next cycle return < $0.50 | Low |
 | Emergency drawdown | Portfolio drawdown > 10% | Critical |
 
-Perp positions are closed via `placePerpOrder()` with `reduceOnly: true` (not the SDK's `closePosition()` which has serialization bugs). Spot positions are unwound via Jupiter reverse swap.
+Perp positions are closed via Hyperliquid reduce-only IOC orders. Spot positions are unwound via Jupiter reverse swap. MarginFi borrows are repaid before collateral is retrieved.
 
 ### Duplicate Position Guard
 
@@ -83,8 +84,6 @@ Before opening any new position, the bot checks if there's already an open posit
 ```
 [INFO] BTC: Position already open — skipping new DELTA_NEUTRAL_OPEN
 ```
-
-This prevents stacking multiple positions on the same asset.
 
 ---
 
@@ -96,7 +95,7 @@ Every cycle starts with a strict reserve-before-execute flow:
 1. **Reserve** — allocate capital for each trade before execution
 2. **Execute** — use only reserved amount (never hardcoded sizes)
 3. **Release** — return reserved capital if execution fails or is skipped
-4. **Lend** — deploy only remaining leftover capital to stable yield
+4. **Lend** — deploy only remaining leftover capital to Kamino USDC lending
 
 ### Carryover Accumulation
 Sub-minimum allocations accumulate across cycles and execute once meaningful:
@@ -110,7 +109,7 @@ The bot evaluates funding rates across 7 chains per cycle and routes capital to 
 
 | Chain | Venue |
 |-------|-------|
-| Solana | Drift Protocol |
+| Solana | Hyperliquid |
 | Arbitrum | GMX |
 | Base | — |
 | Optimism | — |
@@ -118,12 +117,12 @@ The bot evaluates funding rates across 7 chains per cycle and routes capital to 
 | Avalanche | — |
 | BNB Chain | — |
 
-> **Note:** On mainnet, non-Solana chain funding rates return zero (real API integrations pending). Cross-chain execution runs in simulation mode — only Solana/Drift trades are live.
+> **Note:** On mainnet, non-Solana chain funding rates return zero (real API integrations pending). Cross-chain execution runs in simulation mode — only Solana/Hyperliquid trades are live.
 
 ### Adaptive AI Agent
 A lightweight adaptive AI agent module observes funding conditions and gates per-cycle execution:
 
-- Both BTC and ETH can trade simultaneously — the agent only blocks an asset if it explicitly decides to **SKIP** (underperforming). It no longer picks one asset over the other.
+- Both BTC and ETH can trade simultaneously — the agent only blocks an asset if it explicitly decides to **SKIP** (underperforming)
 - Applies dynamic max-size caps derived from confidence, win-rate, and volatility
 - Emits structured `[AI AGENT]` logs each cycle
 - Exposes agent state over the bot API for dashboard rendering
@@ -131,8 +130,9 @@ A lightweight adaptive AI agent module observes funding conditions and gates per
 ### Reverse Delta-Neutral (Negative Funding)
 Delta-neutral execution is explicitly two-way and regime-aware:
 
-- Positive funding: **LONG spot + SHORT perp**
-- Negative funding: **SHORT spot + LONG perp**
+- Positive funding: **LONG spot (Jupiter) + SHORT perp (Hyperliquid)**
+- Negative funding: **BORROW asset (MarginFi) → SELL spot (Jupiter) + LONG perp (Hyperliquid)**
+- Profitability gate: `|fundingRate| × 8760 − borrowRate > 2%` before opening negative-funding trades
 - Exit logic is direction-aware (uses effective funding, not raw sign)
 - Funding regime flips trigger close/reverse behavior
 
@@ -142,7 +142,7 @@ The bot serves a real-time JSON state endpoint at `http://localhost:3001`. The R
 - Prices, funding rates, basis spreads
 - Open positions (per-leg: spot + perp)
 - Execution events and position status
-- Lending by asset
+- Lending by asset (Kamino APR)
 - Capital manager state (reserved, lent, carryover)
 - Cross-chain decisions and funding map
 - AI agent mode, confidence, and decisions
@@ -163,42 +163,41 @@ delta-vault/
 │   ├── .env.example
 │   └── src/
 │       ├── index.ts                   # Main orchestrator + capital manager + bot loop
-│       ├── realMarketData.ts          # Pyth Network + Helius live data
 │       ├── strategyEngine.ts          # Bidirectional signal generation + symmetric sizing
-│       ├── executionEngine.ts         # Drift perp order placement
-│       ├── liveExecution.ts           # Jupiter spot + Drift perp dual-leg execution
 │       ├── enhancedRiskEngine.ts      # Risk checks + smoothed funding volatility + debounce
-│       ├── riskEngine.ts              # Core risk engine (drawdown, delta, collateral)
-│       ├── liquidityGuard.ts          # Jupiter depth + Drift OI validation
-│       ├── walletIntegration.ts       # Server keypair (extends Drift SDK Wallet)
+│       ├── anchorClient.ts            # Anchor on-chain program client (NAV/risk oracle)
+│       ├── walletIntegration.ts       # Standalone ServerWallet (Solana keypair)
+│       ├── telegramAlerts.ts          # Real-time Telegram notifications
 │       ├── logger.ts                  # Structured logging
 │       ├── agent/                     # AI agent module
-│       │   ├── agent.ts              # Agent orchestrator
-│       │   ├── decision.ts           # Decision logic
-│       │   ├── sizing.ts             # Dynamic position sizing
-│       │   ├── state.ts              # Rolling state tracking
-│       │   └── logger.ts             # Agent-specific logging
+│       │   ├── decision.ts            # Decision logic
+│       │   ├── sizing.ts              # Dynamic position sizing
+│       │   ├── state.ts               # Rolling state tracking
+│       │   └── logger.ts              # Agent-specific logging
 │       ├── config/
 │       │   └── crossChain.ts          # Cross-chain chains list + cooldown + horizon config
 │       ├── services/
-│       │   ├── crossChainFunding.ts   # Multi-chain funding aggregator (clamped + normalized)
-│       │   ├── lending.ts             # Drift USDC deposit lending (uses calculateDepositRate)
-│       │   └── costModel.ts           # Route-aware bridge + gas + slippage cost model
+│       │   ├── hyperliquidExecution.ts  # Hyperliquid perp orders + funding data + market snapshots
+│       │   ├── jupiterSpot.ts           # Jupiter V6 spot swaps (buy/sell USDC ↔ asset)
+│       │   ├── kaminoLending.ts         # Kamino Finance USDC lending (supply-side yield)
+│       │   ├── marginFiLending.ts       # MarginFi borrow leg (negative-funding short-spot hedge)
+│       │   ├── crossChainFunding.ts     # Multi-chain funding aggregator (clamped + normalized)
+│       │   └── costModel.ts             # Route-aware bridge + gas + slippage cost model
 │       └── strategy/
-│           ├── crossChainDecision.ts  # Per-asset best-chain selection (fee-adjusted net edge)
-│           └── crossChainExecutor.ts  # Cross-chain move execution wrapper
+│           ├── crossChainDecision.ts    # Per-asset best-chain selection (fee-adjusted net edge)
+│           └── crossChainExecutor.ts    # Cross-chain move execution wrapper
 │
 ├── programs/
 │   └── delta_vault/                   # Anchor on-chain program (Rust)
 │       ├── Cargo.toml
 │       └── src/
 │           ├── lib.rs
-│           ├── vault.rs               # Deposit / withdraw logic
-│           ├── strategy.rs            # Bot authorization + strategy mode
-│           ├── risk.rs                # On-chain guardrails
-│           └── fees.rs                # Management + performance fee accrual
+│           ├── vault.rs               # Deposit / withdraw + NAV staleness guard
+│           ├── strategy.rs            # Bot authorization + 24hr rotation timelock
+│           ├── risk.rs                # On-chain guardrails + risk oracle PDA
+│           └── fees.rs                # Epoch-gated management + performance fees
 │
-├── frontend/                          # Standalone presentation components
+├── frontend/                          # Standalone presentation components (legacy)
 │
 ├── docs/
 │   └── strategy.md
@@ -226,7 +225,8 @@ The dashboard polls the bot state API automatically. Falls back to simulation mo
 cd bot
 npm install
 cp .env.example .env
-# Edit .env — set HELIUS_RPC_URL, HELIUS_WS_URL, WALLET_PRIVATE_KEY_BASE58
+# Edit .env — set HELIUS_RPC_URL, WALLET_PRIVATE_KEY_BASE58
+# For live trading: set EVM_PRIVATE_KEY (Hyperliquid signing)
 npm run dev
 ```
 
@@ -236,17 +236,13 @@ npm run dev
 # Install toolchain (once)
 cargo install --git https://github.com/coral-xyz/anchor --tag v0.29.0 anchor-cli --locked
 
-# Build
+# Build and copy IDL
+cd programs/delta_vault
 anchor build
-
-# Copy IDL to bot
-cp target/idl/delta_vault.json bot/src/idl/delta_vault.json
+cp target/idl/delta_vault.json ../../bot/src/idl/delta_vault.json
 
 # Deploy to devnet
 anchor deploy --provider.cluster devnet
-
-# Deploy to mainnet-beta
-anchor deploy --provider.cluster mainnet-beta --provider.wallet ./keypair.json
 ```
 
 Set the resulting program ID in `.env`:
@@ -265,9 +261,9 @@ chmod +x .githooks/pre-commit
 
 - Node.js 18+
 - A funded Solana wallet (keypair JSON file or base58 private key in `.env`)
-- [Helius API key](https://helius.dev) — mainnet key required for live trading
-- USDC deposited as collateral on [Drift Protocol](https://drift.trade) (mainnet)
-- ~4 SOL in the deployer wallet for vault program deployment (one-time)
+- [Helius API key](https://helius.dev) — devnet key for testing, mainnet for live trading
+- EVM private key for Hyperliquid order signing (live mode only)
+- ~4 SOL in the deployer wallet for vault program deployment (one-time, optional)
 
 ---
 
@@ -283,9 +279,6 @@ chmod +x .githooks/pre-commit
 | Funding rate volatility | > 0.2 relative jump (smoothed, clamped) | Reduce position sizes 50% |
 | Solana RPC latency | > 500ms | Pause execution |
 | Oracle staleness | > 30s | Halt new positions |
-| Drift OI utilization | > 80% | Block trade |
-
-**Drawdown is calculated using actual vault equity from Drift collateral**, not simulated PnL. This prevents false emergency triggers.
 
 ---
 
@@ -294,12 +287,13 @@ chmod +x .githooks/pre-commit
 | Layer | Technology |
 |-------|-----------|
 | Blockchain | Solana (devnet / mainnet-beta) |
-| On-chain Program | Anchor Framework (Rust) |
-| Perp DEX | Drift Protocol v2 |
-| Spot DEX | Jupiter Aggregator (HTTP API) |
-| Price Oracle | Pyth Network (Hermes API) |
+| On-chain Program | Anchor Framework 0.29 (Rust) |
+| Perp DEX | Hyperliquid (EIP-712 signed REST API) |
+| Spot DEX | Jupiter Aggregator V6 (HTTP API) |
+| USDC Lending | Kamino Finance (supply-side, ~4.5% APR) |
+| Borrow (neg. funding) | MarginFi V2 (125% collateral ratio, 80% LTV) |
 | RPC Provider | Helius |
-| Wallet | Server Keypair (extends Drift SDK Wallet) |
+| Wallet | Standalone ServerWallet (Solana keypair) |
 | Cross-Chain | Arbitrum · Base · Optimism · Polygon · Avalanche · BNB |
 | Dashboard | Vite + React 19 (live polling bot state API) |
 | Language | TypeScript (bot) · React JSX (dashboard) · Rust (program) |
@@ -312,6 +306,7 @@ chmod +x .githooks/pre-commit
 - **Never commit** your `keypair.json` or `.env` file
 - Use a **dedicated hot wallet** with only the capital you intend to deploy
 - Add `keypair.json` and `.env` to `.gitignore` (already included)
+- The Anchor program enforces a **24-hour timelock** for bot key rotation
 - Consider a [Squads multisig](https://squads.so) for larger vault sizes
 
 ---

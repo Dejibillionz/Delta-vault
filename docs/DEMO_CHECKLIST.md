@@ -31,7 +31,7 @@ Estimated total setup time: **30–60 minutes** (first time), **5 minutes** (rep
 - [ ] **Test bot starts without errors:**
   ```bash
   npm run dev
-  # You should see: "◈ DELTA VAULT BOT" banner + "DriftClient subscribed"
+  # You should see: "◈ DELTA VAULT BOT" banner + "[HL] Demo mode" + Kamino/MarginFi init logs
   # DEMO_MODE=true so no real orders
   ```
 
@@ -64,7 +64,7 @@ Estimated total setup time: **30–60 minutes** (first time), **5 minutes** (rep
 
 - [ ] Open the dashboard in a browser tab (Claude.ai artifact or CodeSandbox)
 - [ ] Start the bot in a terminal: `cd bot && npm run dev`
-- [ ] Confirm `⬤ PYTH LIVE` badge appears in the dashboard
+- [ ] Confirm `⬤ HL LIVE` badge appears in the dashboard
 - [ ] Confirm BTC/ETH prices are updating (not stuck)
 - [ ] If Telegram is set up: confirm you received the startup message
 - [ ] Have the presentation deck open in PowerPoint
@@ -77,7 +77,7 @@ Estimated total setup time: **30–60 minutes** (first time), **5 minutes** (rep
 3. **Slide 3** — Delta-neutral thesis + yield calculation
 4. **Slide 4** — Capital flow diagram
 5. **Switch to live dashboard** ← the money moment
-   - Show `⬤ PYTH LIVE` with real BTC/ETH prices
+   - Show `⬤ HL LIVE` with real BTC/ETH prices
    - Hit **▶ START BOT** → watch signals populate in real time
    - Point to the Activity Log showing `[TRADE]` and `[INFO]` lines
    - Show the 4 engine sections all working
@@ -95,8 +95,8 @@ Estimated total setup time: **30–60 minutes** (first time), **5 minutes** (rep
 
 > "Most vault strategies are just code on a slide.
 > This one is actually running.
-> The prices you're seeing are live from Pyth Network.
-> The strategy is evaluating real funding rates from Drift Protocol.
+> The prices you're seeing are live from Hyperliquid.
+> The strategy is evaluating real funding rates from Hyperliquid's perpetuals market.
 > And the on-chain risk guardrails are already deployed to devnet."
 
 ---
@@ -105,11 +105,11 @@ Estimated total setup time: **30–60 minutes** (first time), **5 minutes** (rep
 
 **"Is this live trading?"**
 → "The dashboard runs in simulation mode — no real funds at risk —
-  but it's connected to live Pyth oracle prices and real Drift funding
-  rate data. DEMO_MODE=false switches it to live execution."
+  but it's connected to live Hyperliquid funding rate data and Jupiter spot prices.
+  DEMO_MODE=false switches it to live execution."
 
 **"What's the actual APY?"**
-→ "8–25% is the historical opportunity range we've observed in Drift's
+→ "8–25% is the historical opportunity range we've observed in Hyperliquid's
   funding rate data. We deliberately don't call it a target — funding rates
   are entirely market-dependent and can go to zero in low-volatility periods.
   The strategy only enters positions when the rate exceeds our 0.01%/hr threshold."
@@ -120,9 +120,9 @@ Estimated total setup time: **30–60 minutes** (first time), **5 minutes** (rep
   a 24-hour bot rotation timelock, and epoch-gated fee collection.
   It's deployed on devnet at [your program ID]."
 
-**"Why can't you guarantee atomicity across Jupiter and Drift?"**
-→ "They're separate Solana programs — you can't compose them in a single
-  atomic transaction the way you could in an EVM multi-call.
+**"Why can't you guarantee atomicity across Jupiter and Hyperliquid?"**
+→ "They're on separate networks — Jupiter is Solana, Hyperliquid is its own L1.
+  You can't compose them in a single atomic transaction.
   Our mitigation is the 10-second risk loop: any delta breach triggers
   rebalancing before the next trade cycle."
 
@@ -130,7 +130,7 @@ Estimated total setup time: **30–60 minutes** (first time), **5 minutes** (rep
 
 ## Emergency Backup Plan
 
-If the bot crashes or Pyth prices don't load:
+If the bot crashes or Hyperliquid prices don't load:
 - The dashboard still works in simulation mode (toggle off DEMO_MODE)
 - The PnL history charts and gauges still animate
 - The presentation deck has everything you need as standalone content
@@ -142,8 +142,8 @@ If the bot crashes or Pyth prices don't load:
 
 - [ ] Push repo to GitHub: `git init && git add . && git commit -m "Delta Vault hackathon submission" && git push`
 - [ ] Make repo public
-- [ ] Add a description: "Adaptive delta-neutral vault on Solana — Drift Protocol, BTC/ETH, live Pyth prices"
-- [ ] Add topics: `solana`, `drift-protocol`, `defi`, `delta-neutral`, `anchor`, `hackathon`
+- [ ] Add a description: "Adaptive delta-neutral vault — Hyperliquid perps + Jupiter spot + Kamino lending on Solana"
+- [ ] Add topics: `solana`, `hyperliquid`, `jupiter`, `kamino`, `defi`, `delta-neutral`, `anchor`, `hackathon`
 - [ ] Pin the README.md — it has the full architecture overview
 
 ---

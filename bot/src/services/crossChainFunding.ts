@@ -1,103 +1,90 @@
 /**
  * Cross-Chain Funding Aggregator
- * Collects funding rates from multiple chains (Solana/Drift, Arbitrum/GMX).
+ * Collects funding rates from multiple venues.
+ *
+ * Primary:   Hyperliquid REST API (Solana chain entry)
+ * Secondary: Binance Futures + Bybit Linear (real CEX data via CexFundingRates)
+ *
+ * Chain → venue mapping:
+ *   solana             → Hyperliquid (real)
+ *   bnb                → Binance Futures (real)
+ *   arbitrum / base
+ *   / optimism         → Bybit Linear (real — used as a liquid altchain proxy)
+ *   polygon / avalanche → zeroed (no meaningful public perp API)
  */
 
-import { DriftClient } from "@drift-labs/sdk";
+import { HyperliquidExecutor } from "./hyperliquidExecution";
+import { CexFundingRates } from "./cexFundingRates";
 import { Logger } from "../logger";
 import { CROSS_CHAIN_CONFIG } from "../config/crossChain";
 
-type FundingByAsset = { BTC: number; ETH: number };
+type FundingByAsset = Record<string, number>;
 type FundingByChain = Record<string, FundingByAsset>;
 
-// Mock chain feeds — DEVNET ONLY (returns zero on mainnet to disable cross-chain arb)
-async function getMockFunding(chain: string): Promise<FundingByAsset> {
-  if (process.env.SOLANA_NETWORK === "mainnet-beta") {
-    return { BTC: 0, ETH: 0 };
-  }
-  const MOCK: Record<string, FundingByAsset> = {
-    arbitrum: { BTC: 0.00015, ETH: 0.00012 },
-    base: { BTC: 0.00022, ETH: 0.00019 },
-    optimism: { BTC: 0.00018, ETH: 0.00016 },
-    polygon: { BTC: 0.00011, ETH: 0.00014 },
-    avalanche: { BTC: 0.00013, ETH: 0.00010 },
-    bnb: { BTC: 0.00020, ETH: 0.00017 },
-  };
-  return MOCK[chain] ?? { BTC: 0, ETH: 0 };
-}
+// ── Venue mapping ─────────────────────────────────────────────────────────────
 
-// Drift funding rates (existing)
-async function getDriftFunding(driftClient: DriftClient): Promise<FundingByAsset> {
-  const marketIndex = { BTC: 1, ETH: 2 };
-  const rates: { BTC: number; ETH: number } = { BTC: 0, ETH: 0 };
+type CexVenue = "binance" | "bybit" | null;
 
-  for (const [asset, idx] of Object.entries(marketIndex)) {
-    const market = driftClient.getPerpMarketAccount(idx);
-    if (market) {
-      // lastFundingRate is raw integer; convert to decimal funding rate.
-      // Equivalent to: convertToNumber(raw, 1e6) / 1e6
-      const rate = market.amm.lastFundingRate.toNumber() / 1e12;
-      rates[asset as "BTC" | "ETH"] = rate;
-    }
-  }
-
-  return rates;
-}
-
-function normalizeDriftFunding(raw: number): number {
-  // Drift rate is already scaled in getDriftFunding(), so do not rescale again.
-  return raw;
+function chainToVenue(chain: string): CexVenue {
+  if (chain === "bnb")                                   return "binance";
+  if (["arbitrum", "base", "optimism"].includes(chain))  return "bybit";
+  return null;   // polygon / avalanche → no real data → return zeros
 }
 
 function sanitizeFunding(rate: number): number {
-  // clamp extreme values
   return Math.max(Math.min(rate, 0.005), -0.005);
 }
 
-function normalizeFunding(raw: number): number {
-  return sanitizeFunding(normalizeDriftFunding(raw));
+/** Build per-asset funding map for a given chain using real CEX data. */
+function cexChainFunding(
+  cexRates: CexFundingRates,
+  chain: string,
+  assets: string[]
+): FundingByAsset {
+  const venue = chainToVenue(chain);
+  const result: FundingByAsset = {};
+  for (const asset of assets) {
+    result[asset] = venue ? sanitizeFunding(cexRates.getRate(asset, venue)) : 0;
+  }
+  return result;
 }
 
-export async function getCrossChainFunding(driftClient: DriftClient, logger: Logger): Promise<FundingByChain> {
+// ── Public API ────────────────────────────────────────────────────────────────
+
+export async function getCrossChainFunding(
+  hlExecutor: HyperliquidExecutor,
+  logger: Logger,
+  cexRates?: CexFundingRates,
+  assets: string[] = ["BTC", "ETH", "SOL", "JTO"]
+): Promise<FundingByChain> {
   try {
-    const solanaRaw = await getDriftFunding(driftClient);
-    const nonSolanaChains = CROSS_CHAIN_CONFIG.CHAINS.filter(chain => chain !== "solana");
-
-    const mockedRates = await Promise.all(nonSolanaChains.map(chain => getMockFunding(chain)));
-    const nonSolanaMap: FundingByChain = {};
-    nonSolanaChains.forEach((chain, i) => {
-      nonSolanaMap[chain] = mockedRates[i];
-    });
-
-    // Log raw values for debugging
-    logger.info(`RAW Drift funding: ${JSON.stringify(solanaRaw)}`);
-    logger.info(`RAW Non-Solana funding: ${JSON.stringify(nonSolanaMap)}`);
-
-    // Normalize funding rates
-    const solana = {
-      BTC: normalizeFunding(solanaRaw.BTC),
-      ETH: normalizeFunding(solanaRaw.ETH),
-    };
-    const normalizedOthers: FundingByChain = {};
-    for (const [chain, rates] of Object.entries(nonSolanaMap)) {
-      normalizedOthers[chain] = {
-        BTC: normalizeFunding(rates.BTC),
-        ETH: normalizeFunding(rates.ETH),
-      };
+    // 1. Primary: Hyperliquid funding rates (Solana entry)
+    const hlRates = await hlExecutor.getAllFundingRates();
+    const solana: FundingByAsset = {};
+    for (const asset of assets) {
+      solana[asset] = sanitizeFunding(hlRates[asset] ?? 0);
     }
 
-    const fundingByChain: FundingByChain = {
-      solana,
-      ...normalizedOthers,
-    };
+    // 2. Refresh CEX rates (cached internally — 2 min TTL)
+    if (cexRates) await cexRates.refresh();
 
-    logger.info(`Cross-chain funding map: ${JSON.stringify(fundingByChain)}`);
-    return fundingByChain;
+    // 3. Build non-Solana chain entries
+    const nonSolana = CROSS_CHAIN_CONFIG.CHAINS.filter(chain => chain !== "solana");
+    const nonSolanaMap: FundingByChain = {};
+    for (const chain of nonSolana) {
+      nonSolanaMap[chain] = cexRates
+        ? cexChainFunding(cexRates, chain, assets)
+        : Object.fromEntries(assets.map(a => [a, 0]));
+    }
+
+    logger.info(`[CrossChain] HL funding: ${JSON.stringify(solana)}`);
+
+    return { solana, ...nonSolanaMap };
   } catch (err: any) {
     logger.error(`getCrossChainFunding: ${err.message}`);
     const fallback: FundingByChain = {};
     for (const chain of CROSS_CHAIN_CONFIG.CHAINS) {
-      fallback[chain] = { BTC: 0, ETH: 0 };
+      fallback[chain] = Object.fromEntries(assets.map(a => [a, 0]));
     }
     return fallback;
   }

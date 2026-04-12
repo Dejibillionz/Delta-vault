@@ -31,5 +31,5 @@ export const CROSS_CHAIN_CONFIG = {
 
   // true = log-only (no real bridge/execution). Auto-enabled on devnet.
   // Set to false only when real bridge SDK is integrated.
-  SIMULATION_MODE: process.env.SOLANA_NETWORK !== "mainnet-beta" || true,
+  SIMULATION_MODE: process.env.SOLANA_NETWORK !== "mainnet-beta",
 } as const;

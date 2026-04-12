@@ -1,4 +1,4 @@
-export type Asset = "BTC" | "ETH";
+export type Asset = string;
 
 export type TradeFeedback = {
   asset: Asset;
@@ -10,6 +10,8 @@ export type AgentState = {
   confidence: number;
   lastTrades: TradeFeedback[];
   performance: Record<Asset, number>;
+  ewmaFunding: Record<Asset, number>;
+  momentumScore: Record<Asset, number>;
 };
 
 export function createInitialState(): AgentState {
@@ -17,10 +19,9 @@ export function createInitialState(): AgentState {
     winRate: 0.5,
     confidence: 0.5,
     lastTrades: [],
-    performance: {
-      BTC: 0,
-      ETH: 0,
-    },
+    performance:   {},
+    ewmaFunding:   {},
+    momentumScore: {},
   };
 }
 
@@ -32,7 +33,7 @@ export function updateState(state: AgentState, feedback: TradeFeedback): void {
     state.lastTrades.shift();
   }
 
-  state.performance[feedback.asset] += feedback.pnl;
+  state.performance[feedback.asset] = (state.performance[feedback.asset] ?? 0) + feedback.pnl;
 
   if (feedback.pnl > 0) {
     state.winRate += 0.02;

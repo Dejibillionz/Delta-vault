@@ -15,10 +15,7 @@ import {
   PublicKey,
   Transaction,
   VersionedTransaction,
-  SendOptions,
-  Commitment,
 } from "@solana/web3.js";
-import { Wallet } from "@drift-labs/sdk";
 import * as fs from "fs";
 import * as bs58 from "bs58";
 import { Logger } from "./logger";
@@ -38,9 +35,11 @@ export interface WalletInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 // SERVER WALLET — used by the live bot
 // Loads a keypair from disk or env var (base58-encoded private key)
-// Extends Drift SDK's Wallet to ensure full compatibility
+// Implements the signing interface expected by AnchorProvider
 // ─────────────────────────────────────────────────────────────────────────────
-export class ServerWallet extends Wallet {
+export class ServerWallet {
+  readonly keypair: Keypair;
+  readonly publicKey: PublicKey;
   private logger: Logger;
 
   constructor(logger: Logger) {
@@ -58,18 +57,37 @@ export class ServerWallet extends Wallet {
       const decoded = bs58.decode(process.env.WALLET_PRIVATE_KEY_BASE58);
       keypair = Keypair.fromSecretKey(decoded);
       logger.info("ServerWallet loaded from WALLET_PRIVATE_KEY_BASE58 env var");
+    } else if (process.env.DEMO_MODE === "true") {
+      keypair = Keypair.generate();
+      logger.warn("DEMO_MODE: no wallet configured — using ephemeral throwaway keypair (on-chain txs will fail)");
     } else {
       throw new Error(
         "No wallet configured. Set WALLET_KEYPAIR_PATH or WALLET_PRIVATE_KEY_BASE58 in .env"
       );
     }
 
-    // Initialize parent Wallet class with keypair
-    // Cast to any to resolve version mismatch between @solana/web3.js versions
-    super(keypair as any);
-
-    this.logger = logger;
+    this.keypair   = keypair;
+    this.publicKey = keypair.publicKey;
+    this.logger    = logger;
     this.logger.info(`Vault wallet address: ${this.publicKey.toBase58()}`);
+  }
+
+  async signTransaction<T extends Transaction | VersionedTransaction>(tx: T): Promise<T> {
+    if (tx instanceof Transaction) {
+      tx.sign(this.keypair);
+    } else {
+      tx.sign([this.keypair]);
+    }
+    return tx;
+  }
+
+  async signAllTransactions<T extends Transaction | VersionedTransaction>(txs: T[]): Promise<T[]> {
+    return Promise.all(txs.map(tx => this.signTransaction(tx)));
+  }
+
+  async signVersionedTransaction<T extends VersionedTransaction>(tx: T): Promise<T> {
+    tx.sign([this.keypair]);
+    return tx;
   }
 
   getAddress(): string {

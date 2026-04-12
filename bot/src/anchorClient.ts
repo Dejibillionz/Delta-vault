@@ -108,6 +108,7 @@ export class AnchorVaultClient {
       return;
     }
 
+    // Anchor 0.29.x: Program(idl, programId, provider)
     this.program     = new Program(idl, this.programId, this.provider);
     this.isAvailable = true;
     this.logger.info(
@@ -117,7 +118,10 @@ export class AnchorVaultClient {
     );
   }
 
-  ready(): boolean { return this.isAvailable && this.program !== null; }
+  ready(): boolean {
+    if (process.env.DEMO_MODE === "true") return false; // no SOL in demo — skip on-chain
+    return this.isAvailable && this.program !== null;
+  }
 
   // ── update_nav ──────────────────────────────────────────────────────────────
   async updateNav(
@@ -146,7 +150,9 @@ export class AnchorVaultClient {
       this.logger.trade(`updateNav tx: ${txSig}`);
       return txSig;
     } catch (err: any) {
-      this.logger.error(`updateNav failed: ${err.message}`);
+      const logs: string[] = err?.getLogs?.() ?? err?.logs ?? [];
+      const detail = logs.length ? `\n  Logs:\n  ${logs.join("\n  ")}` : "";
+      this.logger.error(`updateNav failed: ${err.message}${detail}`);
       return null;
     }
   }
@@ -172,7 +178,9 @@ export class AnchorVaultClient {
       this.logger.trade(`updateRiskOracle tx: ${txSig}`);
       return txSig;
     } catch (err: any) {
-      this.logger.error(`updateRiskOracle failed: ${err.message}`);
+      const logs: string[] = err?.getLogs?.() ?? err?.logs ?? [];
+      const detail = logs.length ? `\n  Logs:\n  ${logs.join("\n  ")}` : "";
+      this.logger.error(`updateRiskOracle failed: ${err.message}${detail}`);
       return null;
     }
   }
@@ -198,7 +206,9 @@ export class AnchorVaultClient {
       this.logger.trade(`updateStrategy(${mode}) tx: ${txSig}`);
       return txSig;
     } catch (err: any) {
-      this.logger.error(`updateStrategy failed: ${err.message}`);
+      const logs: string[] = err?.getLogs?.() ?? err?.logs ?? [];
+      const detail = logs.length ? `\n  Logs:\n  ${logs.join("\n  ")}` : "";
+      this.logger.error(`updateStrategy failed: ${err.message}${detail}`);
       return null;
     }
   }
@@ -225,17 +235,79 @@ export class AnchorVaultClient {
   async getVaultState(): Promise<any | null> {
     if (!this.ready()) return null;
     try {
-      return await this.program!.account.vaultState.fetch(this.vaultPda);
+      return await (this.program!.account as any).vaultState.fetch(this.vaultPda);
     } catch { return null; }
   }
 
   async getRiskOracleState(): Promise<any | null> {
     if (!this.ready()) return null;
     try {
-      return await this.program!.account.riskOracle.fetch(this.riskOraclePda);
+      return await (this.program!.account as any).riskOracle.fetch(this.riskOraclePda);
     } catch { return null; }
   }
 
   getVaultPda(): PublicKey   { return this.vaultPda; }
   getProgramId(): PublicKey  { return this.programId; }
+
+  // ── deposit ─────────────────────────────────────────────────────────────────
+  /**
+   * Deposit USDC into the vault. The signer (depositor) is the bot wallet.
+   * @param amountUsdc  Raw USDC amount in lamports (6 decimals). E.g. $100 → 100_000_000.
+   */
+  async deposit(amountUsdc: number): Promise<string | null> {
+    if (!this.ready()) return null;
+    try {
+      const txSig = await this.program!.methods
+        .deposit(new BN(Math.round(amountUsdc)))
+        .accounts({
+          vaultState:    this.vaultPda,
+          depositor:     this.provider.wallet.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      this.logger.trade(`deposit ${amountUsdc / 1e6} USDC tx: ${txSig}`);
+      return txSig;
+    } catch (err: any) {
+      const logs: string[] = err?.getLogs?.() ?? err?.logs ?? [];
+      const detail = logs.length ? `\n  Logs:\n  ${logs.join("\n  ")}` : "";
+      this.logger.error(`deposit failed: ${err.message}${detail}`);
+      return null;
+    }
+  }
+
+  // ── withdraw ────────────────────────────────────────────────────────────────
+  /**
+   * Burn shares and withdraw USDC. The signer (depositor) is the bot wallet.
+   * @param shares  Number of shares to burn (6-decimal fixed-point, same precision as USDC).
+   */
+  async withdraw(shares: number): Promise<string | null> {
+    if (!this.ready()) return null;
+    try {
+      const txSig = await this.program!.methods
+        .withdraw(new BN(Math.round(shares)))
+        .accounts({
+          vaultState:    this.vaultPda,
+          depositor:     this.provider.wallet.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      this.logger.trade(`withdraw ${shares} shares tx: ${txSig}`);
+      return txSig;
+    } catch (err: any) {
+      const logs: string[] = err?.getLogs?.() ?? err?.logs ?? [];
+      const detail = logs.length ? `\n  Logs:\n  ${logs.join("\n  ")}` : "";
+      this.logger.error(`withdraw failed: ${err.message}${detail}`);
+      return null;
+    }
+  }
+
+  // ── getVaultStats ───────────────────────────────────────────────────────────
+  async getVaultStats(): Promise<{ nav: number; totalShares: number; navPerShare: number } | null> {
+    const state = await this.getVaultState();
+    if (!state) return null;
+    const nav         = Number(state.nav ?? 0);
+    const totalShares = Number(state.totalShares ?? 0);
+    const navPerShare = totalShares > 0 ? nav / totalShares : 1_000_000; // 1 USDC default
+    return { nav, totalShares, navPerShare };
+  }
 }

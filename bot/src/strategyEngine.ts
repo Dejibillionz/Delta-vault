@@ -8,7 +8,7 @@
  *   3. PARK_CAPITAL  — no opportunity → deploy to stable yield
  */
 
-import { LiveMarketSnapshot } from "./realMarketData";
+import { LiveMarketSnapshot } from "./services/hyperliquidExecution";
 import { Logger } from "./logger";
 
 // ─── Strategy thresholds ──────────────────────────────────────────────────────
@@ -16,13 +16,13 @@ const IS_MAINNET = process.env.SOLANA_NETWORK === "mainnet-beta";
 
 export const THRESHOLDS = {
   // Minimum hourly funding rate to open delta-neutral position
-  FUNDING_RATE_MIN: IS_MAINNET ? 0.0001 : 0.00001,      // mainnet: 0.01%/hr (~8.7% APR), devnet: 0.001%/hr
+  FUNDING_RATE_MIN: IS_MAINNET ? 0.0001 : 0.000001,      // mainnet: 0.01%/hr (~8.7% APR), devnet: 0.0001%/hr (~0.9% APR)
 
   // Minimum basis spread to execute basis trade
   BASIS_SPREAD_MIN: IS_MAINNET ? 0.01 : 0.005,           // mainnet: 1.0%, devnet: 0.5%
 
   // Funding rate below this → exit delta-neutral, too little yield
-  FUNDING_RATE_EXIT: IS_MAINNET ? 0.00005 : 0.00005,     // 0.005% per hour
+  FUNDING_RATE_EXIT: IS_MAINNET ? 0.00005 : 0.0000005,   // mainnet: 0.005%/hr, devnet: 0.00005%/hr
 
   // Basis spread below this → exit basis trade, convergence complete
   BASIS_SPREAD_EXIT: 0.003,       // 0.3%

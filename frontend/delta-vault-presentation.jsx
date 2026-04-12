@@ -3,7 +3,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 /* ═══════════════════════════════════════════════════════════════════════════
    DELTA VAULT — Full Presentation Build
    All 4 engines unified: Market Data · Strategy · Execution · Risk
-   Live Pyth prices · Phantom wallet · Drift Protocol · SIMULATION MODE
+   Live Pyth prices · Phantom wallet · Hyperliquid + Kamino · SIMULATION MODE
 ═══════════════════════════════════════════════════════════════════════════ */
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -248,7 +248,7 @@ export default function DeltaVault() {
     const id = setInterval(() => {
       setTick(t => t + 1);
 
-      // Drift funding & basis walk (server-side in prod; simulated here)
+      // Hyperliquid funding & basis walk (server-side in prod; simulated here)
       setFunding(f => { const n = {}; ASSETS.forEach(a => { n[a] = clamp(f[a] + rand(-0.000012, 0.000014), 0.00002, 0.00042); }); return n; });
       setBasis(b =>   { const n = {}; ASSETS.forEach(a => { n[a] = clamp(b[a] + rand(-0.0007, 0.0007), 0.0008, 0.022); });   return n; });
       setLiquidity(l =>{ const n = {}; ASSETS.forEach(a => { n[a] = clamp(l[a] + rand(-3e5,3e5), 1e6, 20e6); });            return n; });
@@ -271,7 +271,7 @@ export default function DeltaVault() {
               setPositions(p => {
                 if (p.find(x => x.asset === a)) return p;
                 const sz = rand(4000, 18000);
-                addLog("TRADE", `${a} DELTA_NEUTRAL — spot long + perp short $${sz.toFixed(0)} on Drift`);
+                addLog("TRADE", `${a} DELTA_NEUTRAL — spot long + perp short $${sz.toFixed(0)} on Hyperliquid`);
                 setOrders(o => [{
                   id: Date.now(), time: ts(), asset: a,
                   action: "PERP SHORT + SPOT LONG", size: sz, status: "FILLED",
@@ -320,7 +320,7 @@ export default function DeltaVault() {
         return updated;
       });
 
-      addLog("INFO", `Cycle #${tick + 1} — Drift + Pyth scanned`);
+      addLog("INFO", `Cycle #${tick + 1} — Hyperliquid + Pyth scanned`);
     }, 2500);
     return () => clearInterval(id);
   }, [running, addLog, tick]);
@@ -368,7 +368,7 @@ export default function DeltaVault() {
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <span style={{ fontSize: 10, fontWeight: 500, color: "#f59e0b", letterSpacing: 2.5 }}>⚠ SIMULATION MODE</span>
           <span style={{ width: 1, height: 12, background: "#3a2a10", display: "inline-block" }} />
-          <span style={{ fontSize: 9, color: "#5a3c18", letterSpacing: .5 }}>No real funds at risk · Paper execution · Connect Phantom wallet to go live on Drift</span>
+          <span style={{ fontSize: 9, color: "#5a3c18", letterSpacing: .5 }}>No real funds at risk · Paper execution · Connect Phantom wallet to go live on Hyperliquid</span>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span style={{
@@ -393,7 +393,7 @@ export default function DeltaVault() {
               ◈ DELTA VAULT
             </div>
             <div style={{ fontSize: 8, color: "#1e2e3e", letterSpacing: 3.5, marginTop: 1 }}>
-              DRIFT PROTOCOL · SOLANA · BTC/ETH · DELTA-NEUTRAL STRATEGY
+              HYPERLIQUID · KAMINO · SOLANA · BTC/ETH/SOL/JTO · DELTA-NEUTRAL
             </div>
           </div>
           {/* Tabs */}
@@ -427,7 +427,7 @@ export default function DeltaVault() {
             <span className={running ? "blink" : ""} style={{ width: 7, height: 7, borderRadius: "50%", background: running ? "#00ffa3" : "#1e2e3e", display: "inline-block" }} />
             <span style={{ fontSize: 9, color: running ? "#00ffa3" : "#2e3e50", letterSpacing: 1 }}>{running ? "RUNNING" : "IDLE"}</span>
           </div>
-          <button onClick={() => { setRunning(r => !r); addLog("SYS", running ? "Bot stopped" : "Bot started — scanning Drift Protocol"); }} style={{
+          <button onClick={() => { setRunning(r => !r); addLog("SYS", running ? "Bot stopped" : "Bot started — scanning Hyperliquid"); }} style={{
             cursor: "pointer", border: `1px solid ${running ? "#f8717144" : "#00ffa344"}`,
             borderRadius: 7, background: running ? "#120707" : "#071209",
             color: running ? "#f87171" : "#00ffa3",
@@ -516,7 +516,7 @@ export default function DeltaVault() {
               </div>
               <div style={{ marginTop: 10, fontSize: 8, color: "#1e2e3e", padding: "6px 10px", background: "#060911", borderRadius: 6, lineHeight: 1.7 }}>
                 Spot prices → <span style={{ color: "#34d399" }}>Pyth Network Hermes API</span> ·
-                Funding rates → <span style={{ color: "#5ba8d0" }}>Drift Protocol AMM</span> ·
+                Funding rates → <span style={{ color: "#5ba8d0" }}>Hyperliquid REST API</span> ·
                 Basis = (perp − spot) / spot ·
                 Real-time Helius WebSocket in production
               </div>
@@ -580,7 +580,7 @@ export default function DeltaVault() {
               {/* Protocol stack */}
               <div style={{ display: "flex", gap: 7, marginBottom: 12 }}>
                 {[
-                  { l: "PERP EXCHANGE", v: "Drift Protocol v2", c: "#f59e0b", sub: "Solana mainnet" },
+                  { l: "PERP EXCHANGE", v: "Hyperliquid", c: "#f59e0b", sub: "EIP-712 signed REST" },
                   { l: "SPOT ROUTING",  v: "Jupiter Aggregator", c: "#00ffa3", sub: "v6 API" },
                   { l: "RPC PROVIDER",  v: "Helius",             c: "#5ba8d0", sub: "WebSocket + REST" },
                   { l: "WALLET",        v: wallet.connected ? shortAddr(wallet.address) : "Phantom", c: "#a78bfa", sub: wallet.connected ? "Connected" : "Not connected" },
@@ -602,7 +602,7 @@ export default function DeltaVault() {
                   { icon: "→", label: "", sub: "", c: "#1e2e3e" },
                   { icon: "◑", label: "Jupiter", sub: "spot long", c: "#00ffa3" },
                   { icon: "+", label: "", sub: "", c: "#1e2e3e" },
-                  { icon: "◐", label: "Drift", sub: "perp short", c: "#f59e0b" },
+                  { icon: "◐", label: "Hyperliquid", sub: "perp short", c: "#f59e0b" },
                   { icon: "→", label: "", sub: "", c: "#1e2e3e" },
                   { icon: "⬡", label: "Wallet", sub: "signed tx", c: "#a78bfa" },
                 ].map((s, i) => (
@@ -740,7 +740,7 @@ export default function DeltaVault() {
         <div className="fadein" style={{ padding: "24px", maxWidth: 900, margin: "0 auto" }}>
           <div style={{ textAlign: "center", marginBottom: 30 }}>
             <div style={{ fontSize: 24, fontWeight: 800, color: "#00ffa3", fontFamily: "'Syne',sans-serif", letterSpacing: 1 }}>System Architecture</div>
-            <div style={{ fontSize: 10, color: "#2a3a4e", marginTop: 4, letterSpacing: 2 }}>DELTA-NEUTRAL VAULT · SOLANA · DRIFT PROTOCOL</div>
+            <div style={{ fontSize: 10, color: "#2a3a4e", marginTop: 4, letterSpacing: 2 }}>DELTA-NEUTRAL VAULT · SOLANA · HYPERLIQUID + KAMINO</div>
           </div>
 
           {/* Architecture diagram */}
@@ -752,8 +752,8 @@ export default function DeltaVault() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
                 {[
                   { icon: "◎", title: "Pyth Network", sub: "Hermes REST + WebSocket", desc: "Real-time BTC/ETH spot prices with confidence intervals. Feeds strategy engine every 12s.", col: "#34d399" },
-                  { icon: "⬡", title: "Helius RPC",   sub: "Solana mainnet-beta",   desc: "High-performance RPC for Drift account subscriptions, tx sending, and oracle monitoring.", col: "#5ba8d0" },
-                  { icon: "◈", title: "Drift Oracle",  sub: "AMM funding rates",     desc: "Live perp mark prices, hourly funding rates, open interest, and long/short ratios.", col: "#f59e0b" },
+                  { icon: "⬡", title: "Helius RPC",   sub: "Solana RPC + WebSocket",   desc: "High-performance RPC for Solana tx sending, oracle monitoring, and on-chain vault state reads.", col: "#5ba8d0" },
+                  { icon: "◈", title: "Hyperliquid",  sub: "AMM funding rates",     desc: "Live perp mark prices, hourly funding rates, open interest, and long/short ratios.", col: "#f59e0b" },
                 ].map(c => (
                   <Card key={c.title} style={{ border: `1px solid ${c.col}22` }}>
                     <div style={{ fontSize: 18, color: c.col, marginBottom: 7 }}>{c.icon}</div>
@@ -798,7 +798,7 @@ export default function DeltaVault() {
               <div style={{ fontSize: 8, color: "#2a3a4e", letterSpacing: 2, marginBottom: 8, textAlign: "center" }}>EXECUTION LAYER</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
                 {[
-                  { icon: "③", title: "Drift Protocol", col: "#f59e0b", desc: "Solana perp DEX. Places PERP SHORT via placePerpOrder(). Closes via closePosition(). Rebalances on delta breach." },
+                  { icon: "③", title: "Hyperliquid", col: "#f59e0b", desc: "Perp execution via EIP-712 signed REST API. Places PERP SHORT for positive funding arb. Closes via market order. Rebalances on delta breach." },
                   { icon: "◑", title: "Jupiter v6",      col: "#00ffa3", desc: "Best-route spot swaps. USDC → BTC/ETH for spot long leg. Price impact checked < 0.5% before execution." },
                   { icon: "⬡", title: "Phantom / Vault Keypair", col: "#a78bfa", desc: "Browser: Phantom wallet for manual approvals. Server: secure keypair from env var. Signs all transactions." },
                 ].map(c => (
@@ -849,7 +849,7 @@ export default function DeltaVault() {
             <div style={{ fontSize: 10, color: "#4a6a7a", lineHeight: 1.8 }}>
               In crypto perpetual markets, traders who hold long positions pay a <span style={{ color: "#00ffa3" }}>funding rate</span> to short holders
               when the market is bullish. Delta Vault captures this yield by simultaneously holding
-              a <span style={{ color: "#00ffa3" }}>spot LONG</span> (via Jupiter) and a <span style={{ color: "#f59e0b" }}>perp SHORT</span> (via Drift) of equal size.
+              a <span style={{ color: "#00ffa3" }}>spot LONG</span> (via Jupiter) and a <span style={{ color: "#f59e0b" }}>perp SHORT</span> (via Hyperliquid) of equal size.
               The two positions cancel out all price exposure (delta = ~0), leaving only the funding yield.
             </div>
           </Card>
@@ -857,9 +857,9 @@ export default function DeltaVault() {
           {/* 3-step flow */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 14 }}>
             {[
-              { n: "01", title: "Scan", col: "#34d399", desc: "Every 30s, the Market Data Engine polls Pyth for live BTC/ETH prices and reads Drift's AMM for hourly funding rates and basis spreads." },
+              { n: "01", title: "Scan", col: "#34d399", desc: "Every 15s, the Market Data Engine polls Hyperliquid REST API for live BTC/ETH/SOL/JTO prices, perp funding rates, and open interest." },
               { n: "02", title: "Decide", col: "#5ba8d0", desc: "The Strategy Engine applies thresholds. If funding > 0.01%/hr, a delta-neutral trade is worthwhile. If basis > 1%, a basis convergence trade fires." },
-              { n: "03", title: "Execute", col: "#f59e0b", desc: "Both legs placed atomically. Spot LONG via Jupiter swap, perp SHORT via Drift placePerpOrder(). If either leg fails, the other is automatically unwound." },
+              { n: "03", title: "Execute", col: "#f59e0b", desc: "Both legs placed atomically. Spot LONG via Jupiter V6 swap, perp SHORT via Hyperliquid EIP-712 REST order. If either leg fails, the other is automatically unwound." },
             ].map(s => (
               <Card key={s.n} style={{ border: `1px solid ${s.col}22` }}>
                 <div style={{ fontSize: 28, fontWeight: 800, color: s.col + "33", fontFamily: "'Syne',sans-serif", marginBottom: 6 }}>{s.n}</div>
@@ -899,7 +899,7 @@ export default function DeltaVault() {
           {/* Advantages */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             <Card style={{ border: "1px solid #00ffa322" }}>
-              <div style={{ fontSize: 11, fontWeight: 500, color: "#00ffa3", marginBottom: 8 }}>Why Drift Protocol</div>
+              <div style={{ fontSize: 11, fontWeight: 500, color: "#00ffa3", marginBottom: 8 }}>Why Hyperliquid</div>
               {["Highest perp liquidity on Solana", "Sub-second transaction finality", "Low fees (< $0.01 per trade)", "Open-source, audited smart contracts", "Native USDC collateral — no wrapping"].map((t, i) => (
                 <div key={i} style={{ display: "flex", gap: 7, alignItems: "center", marginBottom: 5 }}>
                   <span style={{ color: "#00ffa3", fontSize: 9 }}>✓</span>
