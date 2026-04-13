@@ -54,8 +54,9 @@ const ETM_COOLDOWN_LONG_THRESH  = parseFloat(process.env.ETM_COOLDOWN_LONG_THRES
 const FRC_SPIKE_EXIT_FLAT_CYCLES = parseInt(process.env.FRC_SPIKE_EXIT_FLAT_CYCLES ?? "2");
 
 // ATR-scaled cooldown: scales all cooldown durations by market volatility
-const ETM_ATR_BASELINE = parseFloat(process.env.ETM_ATR_BASELINE ?? "0.01"); // 1% ATR = 1× multiplier
-const ETM_ATR_VOL_CAP  = parseFloat(process.env.ETM_ATR_VOL_CAP  ?? "2.0");  // max multiplier cap
+const ETM_ATR_BASELINE  = parseFloat(process.env.ETM_ATR_BASELINE  ?? "0.01"); // 1% ATR = 1× multiplier
+const ETM_ATR_VOL_CAP   = parseFloat(process.env.ETM_ATR_VOL_CAP   ?? "2.0");  // max multiplier cap
+const ETM_ATR_EMA_ALPHA = parseFloat(process.env.ETM_ATR_EMA_ALPHA ?? "0.2");  // smoothing for ATR to prevent spike inflation
 
 // ── Types ───────────────────────────────────────────────────────────────────
 export type FundingRegime =
@@ -99,6 +100,7 @@ export class FundingRegimeClassifier {
 
   // ETM state (mutated by getExitSignal)
   private readonly exitScoreEMA    = new Map<string, number>();   // smoothed exit score per asset
+  private readonly atrEMA          = new Map<string, number>();   // smoothed ATR to prevent cooldown spike inflation
   private readonly reduceCooldown  = new Map<string, number>();   // cycles remaining after REDUCE_50
   private readonly spikeExitCooldown = new Map<string, number>(); // cycles before re-entry after spike FULL_EXIT
 
@@ -215,9 +217,12 @@ export class FundingRegimeClassifier {
       effectiveScore >= ETM_EXIT_PARTIAL          ? "REDUCE_50" :
       "HOLD";
 
-    // ── ATR volatility multiplier: scale all cooldowns with market speed ─────
-    const atrPct    = snap.atrPct ?? ETM_ATR_BASELINE;
-    const volMult   = Math.min(ETM_ATR_VOL_CAP, Math.max(1.0, atrPct / ETM_ATR_BASELINE));
+    // ── ATR volatility multiplier: EMA-smooth ATR to prevent single-candle cooldown inflation ──
+    const atrRaw     = snap.atrPct ?? ETM_ATR_BASELINE;
+    const prevAtr    = this.atrEMA.get(asset) ?? atrRaw;
+    const atrSmoothed = ETM_ATR_EMA_ALPHA * atrRaw + (1 - ETM_ATR_EMA_ALPHA) * prevAtr;
+    this.atrEMA.set(asset, atrSmoothed);
+    const volMult    = Math.min(ETM_ATR_VOL_CAP, Math.max(1.0, atrSmoothed / ETM_ATR_BASELINE));
 
     // ── Context-aware cooldown: reflect actual decision pressure (inc. PEAK_EARLY bias) ─
     if (action === "REDUCE_50") {
