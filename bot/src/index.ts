@@ -86,6 +86,8 @@ const MAX_ABSOLUTE_FUNDING_APR = parseFloat(process.env.FUNDING_CIRCUIT_BREAKER_
 const MAX_GROSS_NOTIONAL_RATIO = parseFloat(process.env.MAX_GROSS_NOTIONAL_RATIO ?? "1.5");
 // Bybit venue routing: route to Bybit when its APR exceeds HL by at least this spread
 const BYBIT_ARB_MIN_SPREAD = parseFloat(process.env.BYBIT_ARB_MIN_SPREAD_APR ?? "0.02");
+// Slippage guard: if perp fill slippage exceeds this fraction, abort the trade and close immediately
+const MAX_SLIPPAGE_PCT = parseFloat(process.env.MAX_SLIPPAGE_PCT ?? "0.003"); // 0.3% default
 
 // Comma-separated assets to trade, e.g. "BTC,ETH,SOL,JTO"
 const TRADING_ASSETS = (process.env.TRADING_ASSETS ?? "BTC,ETH,SOL,JTO")
@@ -219,6 +221,8 @@ async function main() {
   const positions = new Map<string, any>();
   const fundingCircuitBreakers = new Set<string>(); // assets blocked due to extreme funding APR
   const tradeHistory: TradeRecord[] = [];           // last 100 completed trades
+  let manualHalt = false;                           // kill switch — set via POST /admin/halt
+  let scoreWeightMap: Map<string, number> = new Map(); // score-weighted capital share per asset
   let tick = 0;
   let simulatedPnl = 0; // Simulated profit for demo
   let cumulativeRealizedPnl = 0; // Running total of closed-position PnL
@@ -352,6 +356,23 @@ async function main() {
           res.end(JSON.stringify({ error: err.message }));
         }
       });
+      return;
+    }
+
+    // Kill switch endpoints
+    if (req.method === "POST" && req.url === "/admin/halt") {
+      manualHalt = true;
+      logger.risk("[KILL SWITCH] Manual halt activated — all new position opens blocked");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ halted: true }));
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/admin/resume") {
+      manualHalt = false;
+      logger.info("[KILL SWITCH] Manual halt cleared — trading resumed");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ halted: false }));
       return;
     }
 
@@ -589,6 +610,46 @@ async function main() {
           }
         }
 
+        if (ev.action === "REBALANCE") {
+          // Correct delta drift by executing a corrective half-delta trade
+          for (const [, pos] of positions) {
+            const asset = pos.asset as string;
+            const spotPos = positions.get(`${asset}_SPOT`);
+            const perpPos = positions.get(`${asset}_PERP`);
+            if (!spotPos || !perpPos) continue;
+            const spotQ = spotPos.quoteAmount ?? 0;
+            const perpQ = perpPos.quoteAmount ?? 0;
+            const maxQ  = Math.max(spotQ, perpQ);
+            if (maxQ === 0) continue;
+            const drift = Math.abs(spotQ - perpQ) / maxQ;
+            if (drift < 0.05) continue;
+            const correctionUsd = Math.abs(spotQ - perpQ) / 2;
+            if (DEMO_MODE) {
+              // Simulate corrective trade in-memory
+              if (spotQ > perpQ) {
+                perpPos.quoteAmount = (perpQ + correctionUsd);
+                logger.info(`[REBALANCE] ${asset}: +$${correctionUsd.toFixed(0)} short perp (sim) — drift was ${(drift * 100).toFixed(1)}%`);
+              } else {
+                spotPos.quoteAmount = (spotQ + correctionUsd);
+                logger.info(`[REBALANCE] ${asset}: +$${correctionUsd.toFixed(0)} long spot (sim) — drift was ${(drift * 100).toFixed(1)}%`);
+              }
+            } else {
+              const snap = marketEngine.getSnapshot(asset);
+              if (!snap) continue;
+              try {
+                if (spotQ > perpQ) {
+                  await hlExecutor.openShort(asset, correctionUsd / snap.perpPrice, snap.perpPrice);
+                } else {
+                  await jupiterSwap.swap("USDC", asset, correctionUsd, snap.spotPrice);
+                }
+                logger.info(`[REBALANCE] ${asset}: corrected ${(drift * 100).toFixed(1)}% drift by $${correctionUsd.toFixed(0)}`);
+              } catch (rebErr: any) {
+                logger.warn(`[REBALANCE] ${asset}: corrective trade failed — ${rebErr.message}`);
+              }
+            }
+          }
+        }
+
         if (["HIGH", "CRITICAL"].includes(ev.severity) && !["EMERGENCY_CLOSE", "CLOSE_POSITION", "NORMAL"].includes(ev.action)) {
           await telegram.riskAlert(ev.message, metrics.drawdown, metrics.deltaExposurePct);
         }
@@ -686,6 +747,26 @@ async function main() {
         scanner.updateCycle();
         if (scanner.shouldRescan()) {
           const result = await scanner.scan();
+          // Build score-weighted capital shares + BTC/ETH correlation haircut
+          {
+            const scanEntries = scanner.getLastScanEntries().filter(e => e.selected);
+            const scoreSum = scanEntries.reduce((s, e) => s + Math.max(0, e.compositeScore), 0);
+            scoreWeightMap = new Map(scanEntries.map(e => [
+              e.asset,
+              scoreSum > 0 ? Math.max(0, e.compositeScore) / scoreSum : 1 / scanEntries.length
+            ]));
+            if (scoreWeightMap.has("BTC") && scoreWeightMap.has("ETH")) {
+              const ethW  = scoreWeightMap.get("ETH")! * 0.80;
+              const freed = scoreWeightMap.get("ETH")! - ethW;
+              scoreWeightMap.set("ETH", ethW);
+              const others    = [...scoreWeightMap.keys()].filter(a => a !== "BTC" && a !== "ETH");
+              const otherSum  = others.reduce((s, a) => s + scoreWeightMap.get(a)!, 0);
+              if (otherSum > 0) {
+                for (const a of others) scoreWeightMap.set(a, scoreWeightMap.get(a)! + freed * (scoreWeightMap.get(a)! / otherSum));
+              }
+              logger.info(`[SCANNER] BTC/ETH correlation haircut applied — ETH weight reduced 20%, redistributed to ${others.join(", ") || "none"}`);
+            }
+          }
           if (result.changed) {
             activeAssets = applyAssetSetChange(
               result, positions, tradeCarryOver, currentStrategies,
@@ -867,7 +948,7 @@ async function main() {
           finalAllocation = { delta: 0, lending: 1 };
         }
 
-        const capitalPerAsset = totalCapital / activeAssets.length;
+        const capitalPerAsset = totalCapital * (scoreWeightMap.get(asset) ?? 1 / activeAssets.length);
         // Ensure delta allocation is at least MIN_TRADE_SIZE when signal wants to open
         const rawDeltaCapital = capitalPerAsset * finalAllocation.delta;
         const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(MIN_TRADE_SIZE, rawDeltaCapital));
@@ -886,6 +967,8 @@ async function main() {
         if (isOpenSignal && hasOpenPosition) {
           logger.info(`${asset}: Position already open — skipping new ${signal.signal}`);
           executionData.events.push(`${asset}: position already open — skipped duplicate entry`);
+        } else if (isOpenSignal && manualHalt) {
+          executionData.events.push(`${asset}: manual halt active — all new entries blocked`);
         } else if (isOpenSignal && drainingAssets.has(asset)) {
           // Asset is being retired — let existing positions close, block new opens
           executionData.events.push(`${asset}: draining — no new entries until position closes`);
@@ -1243,6 +1326,7 @@ async function main() {
         },
       };
       botState.tradeHistory = tradeHistory.slice(-100);
+      botState.manualHalt   = manualHalt;
 
       // ── Organized Logging (gated to every LOG_EVERY_N cycles) ─────────────
       if (shouldLog) {
@@ -1500,6 +1584,17 @@ async function handleSignalLive(
           perpOrderResult = useBybit
             ? await bybitExecutor!.openLong(asset, executionSizeUSD, signal.metadata.perpPrice)
             : await hlExec.openLong(asset, executionSizeUSD, signal.metadata.perpPrice);
+        }
+
+        // Slippage guard: if perp fill slippage exceeds MAX_SLIPPAGE_PCT, abort and unwind
+        if (perpOrderResult && perpOrderResult.slippagePct > MAX_SLIPPAGE_PCT) {
+          logger.warn(`[SLIPPAGE_ABORT] ${asset}: slippage ${(perpOrderResult.slippagePct * 100).toFixed(3)}% > ${(MAX_SLIPPAGE_PCT * 100).toFixed(3)}% limit — unwinding`);
+          // Close perp (use IOC market close — no size arg needed, uses full position)
+          await hlExec.closePosition(asset).catch(() => {});
+          // Remove spot if already set this cycle
+          if (positions.has(`${asset}_SPOT`)) positions.delete(`${asset}_SPOT`);
+          events.push(`${asset}: SLIPPAGE_ABORT — trade unwound (slippage ${(perpOrderResult.slippagePct * 100).toFixed(3)}%)`);
+          break;
         }
 
         positions.set(`${asset}_PERP`, {

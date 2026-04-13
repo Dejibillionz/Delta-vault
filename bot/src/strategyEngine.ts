@@ -64,8 +64,9 @@ export interface ActiveState {
   [asset: string]: AssetStrategyState;
 }
 
-// Minimum ms funding must stay above threshold before entry (30s = 2 × 15s cycles)
-const MOMENTUM_WINDOW_MS = 30_000;
+// Minimum consecutive cycles funding must stay above threshold before entry
+// Default: 5 cycles × 15s = 75s of sustained signal (env-overridable)
+const MOMENTUM_CONFIRM_CYCLES = parseInt(process.env.MOMENTUM_CONFIRM_CYCLES ?? "5");
 
 // ─── Strategy Engine ──────────────────────────────────────────────────────────
 export class StrategyEngine {
@@ -77,8 +78,8 @@ export class StrategyEngine {
   // -1 = entered on negative funding (short spot / long perp)
   private fundingDir: Record<string, 1 | -1> = {};
   private entryFundingRate: Record<string, number> = {};
-  // Timestamp when funding first exceeded threshold (null = not yet/reset)
-  private fundingMomentumSince: Record<string, number | null> = {};
+  // Consecutive cycles funding has stayed above threshold (reset on drop or position open)
+  private fundingConfirmCycles: Record<string, number> = {};
 
   constructor(logger: Logger) {
     this.logger = logger;
@@ -94,9 +95,9 @@ export class StrategyEngine {
 
   setState(asset: string, val: AssetStrategyState): void {
     this.state[asset] = val;
-    // Reset momentum when explicitly set to NONE/PARKED
+    // Reset cycle counter when explicitly set to NONE/PARKED
     if (val === "NONE" || val === "PARKED") {
-      this.fundingMomentumSince[asset] = null;
+      this.fundingConfirmCycles[asset] = 0;
     }
   }
 
@@ -149,8 +150,8 @@ export class StrategyEngine {
           ? `Funding regime flipped — reversing to ${dir < 0 ? "LONG spot + SHORT perp" : "SHORT spot + LONG perp"}`
           : `Effective funding ${pct(effectiveFunding)} fell below exit threshold — closing`;
         this.logger.info(`${asset} ${reason}`);
-        // Reset momentum so re-entry requires a fresh 30s window
-        this.fundingMomentumSince[asset] = null;
+        // Reset cycle counter so re-entry requires a fresh confirmation window
+        this.fundingConfirmCycles[asset] = 0;
         return { asset, signal: "DELTA_NEUTRAL_CLOSE", reason, urgency: regimeFlipped ? "HIGH" : "MEDIUM", suggestedSizeUSD: 0, metadata: meta };
       }
     }
@@ -175,19 +176,15 @@ export class StrategyEngine {
         Math.abs(fundingRate) > THRESHOLDS.FUNDING_RATE_MIN &&
         liquidityScore >= THRESHOLDS.MIN_LIQUIDITY_SCORE
       ) {
-        // ── Funding momentum filter: sustained signal for MOMENTUM_WINDOW_MS ──
-        const now = Date.now();
-        if (!this.fundingMomentumSince[asset]) {
-          this.fundingMomentumSince[asset] = now;
-        }
-        const elapsedMs = now - (this.fundingMomentumSince[asset] as number);
+        // ── Funding momentum filter: sustained signal for MOMENTUM_CONFIRM_CYCLES ──
+        this.fundingConfirmCycles[asset] = (this.fundingConfirmCycles[asset] ?? 0) + 1;
+        const confirmedCycles = this.fundingConfirmCycles[asset];
 
-        if (elapsedMs < MOMENTUM_WINDOW_MS) {
-          const remainS = Math.ceil((MOMENTUM_WINDOW_MS - elapsedMs) / 1000);
+        if (confirmedCycles < MOMENTUM_CONFIRM_CYCLES) {
           return {
             asset,
             signal: "NO_ACTION",
-            reason: `Funding momentum building — ${remainS}s remaining (need ${MOMENTUM_WINDOW_MS / 1000}s sustained)`,
+            reason: `Confirming funding momentum (${confirmedCycles}/${MOMENTUM_CONFIRM_CYCLES} cycles confirmed)`,
             urgency: "LOW",
             suggestedSizeUSD: 0,
             metadata: meta,
@@ -195,12 +192,13 @@ export class StrategyEngine {
         }
 
         // Momentum confirmed — open position
+        this.fundingConfirmCycles[asset] = 0; // reset for next entry
         this.fundingDir[asset] = fundingRate >= 0 ? 1 : -1;
         this.entryFundingRate[asset] = fundingRate;
         const size = this.sizeDeltaNeutral(fundingRate, maxSize);
         const fundingDirection = fundingRate >= 0 ? "positive" : "negative";
         this.logger.trade(
-          `${asset} SIGNAL: DELTA_NEUTRAL_OPEN — ${fundingDirection} FR=${pct(fundingRate)}, size=$${size.toFixed(0)} (momentum confirmed ${Math.floor(elapsedMs / 1000)}s)`
+          `${asset} SIGNAL: DELTA_NEUTRAL_OPEN — ${fundingDirection} FR=${pct(fundingRate)}, size=$${size.toFixed(0)} (${confirmedCycles} cycles confirmed)`
         );
         return {
           asset,
@@ -213,8 +211,8 @@ export class StrategyEngine {
           metadata: meta,
         };
       } else {
-        // Funding dropped below threshold — reset momentum timer
-        this.fundingMomentumSince[asset] = null;
+        // Funding dropped below threshold — reset cycle counter
+        this.fundingConfirmCycles[asset] = 0;
       }
 
       // 2. Basis trade: capture spread convergence

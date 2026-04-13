@@ -384,6 +384,7 @@ export interface LiveMarketSnapshot {
   liquidityScore: number;
   pythConfidence: number;
   oiChangeRatePct: number;   // (latestOI − oldestOI) / oldestOI over last 4 samples
+  atrPct: number;            // price stdDev / mean over last 24 samples (~6h at 15s cycles)
 }
 
 export class HLMarketDataEngine {
@@ -393,6 +394,7 @@ export class HLMarketDataEngine {
   private lastFetch = 0;
   private CACHE_MS = 10_000; // re-fetch every 10s max
   private oiHistory: Map<string, number[]> = new Map(); // asset → ring of last 4 OI-USD values
+  private priceHistory: Map<string, number[]> = new Map(); // asset → ring of last 24 markPx values
 
   constructor(executor: HyperliquidExecutor, logger: Logger) {
     this.executor = executor;
@@ -442,6 +444,19 @@ export class HLMarketDataEngine {
         const oiChangeRatePct = oiRing.length >= 2
           ? (oiRing[oiRing.length - 1] - oiRing[0]) / Math.max(oiRing[0], 1)
           : 0;
+
+        // ATR proxy: stdDev / mean of last 24 mark prices (~6h at 15s cycles)
+        const pxRing = this.priceHistory.get(asset) ?? [];
+        pxRing.push(markPx);
+        if (pxRing.length > 24) pxRing.shift();
+        this.priceHistory.set(asset, pxRing);
+        let atrPct = 0;
+        if (pxRing.length >= 2) {
+          const pxMean = pxRing.reduce((s, v) => s + v, 0) / pxRing.length;
+          const pxStd  = Math.sqrt(pxRing.reduce((s, v) => s + (v - pxMean) ** 2, 0) / pxRing.length);
+          atrPct = pxMean > 0 ? pxStd / pxMean : 0;
+        }
+
         this.store.set(asset, {
           asset,
           timestamp:              now,
@@ -459,6 +474,7 @@ export class HLMarketDataEngine {
           liquidityScore:         0.9,  // HL is highly liquid
           pythConfidence:         0.001,
           oiChangeRatePct,
+          atrPct,
         });
       }
     } catch (err: any) {

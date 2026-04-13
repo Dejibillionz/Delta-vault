@@ -34,6 +34,7 @@ export interface AssetScanEntry {
   trendDirection: 'rising' | 'stable' | 'falling';
   hlPremiumApr: number;      // HL funding rate − best CEX, annualised (signed)
   oiVelocityPct: number;     // OI change rate over last 4 snapshots (negative = unwinding)
+  atrPct: number;            // price stdDev / mean over last 24 cycles (~6h)
 }
 
 export interface ScanResult {
@@ -70,6 +71,8 @@ export class FundingRateScanner {
   private selected: string[] = [];
   // Timestamp of last full scan
   private lastScanTs = 0;
+  // Cached last scan entries (for score-weighted capital allocation in index.ts)
+  private lastScanEntries: AssetScanEntry[] = [];
 
   constructor(
     marketEngine: HLMarketDataEngine,
@@ -178,10 +181,16 @@ export class FundingRateScanner {
       const oiVelMult     = oiVelocityPct < -0.05 ? 0.80 :
                             oiVelocityPct < -0.02 ? 0.90 : 1.00;
 
-      // Composite: 50% funding | 30% stability | 20% liquidity — then trend + CEX + OI velocity
+      // ATR multiplier: high price volatility → penalise (harder to stay delta-neutral)
+      const atrPct    = snap.atrPct ?? 0;
+      const atrMult   = atrPct > 0.05 ? 0.75 :   // >5% price stdDev → risky
+                        atrPct > 0.02 ? 0.90 :   // 2-5% → caution
+                        1.00;
+
+      // Composite: 50% funding | 30% stability | 20% liquidity — then trend + CEX + OI velocity + ATR
       const compositeScore =
         (0.50 * fundingScore + 0.30 * stabilityScore + 0.20 * liquidityScore)
-        * trendMult * cexMult * oiVelMult;
+        * trendMult * cexMult * oiVelMult * atrMult;
 
       entries.push({
         asset,
@@ -196,11 +205,15 @@ export class FundingRateScanner {
         trendDirection:  trend.direction,
         hlPremiumApr,
         oiVelocityPct,
+        atrPct,
       });
     }
 
     // Sort descending by composite score
     entries.sort((a, b) => b.compositeScore - a.compositeScore);
+
+    // Cache for external consumers (e.g. score-weighted capital allocation in index.ts)
+    this.lastScanEntries = entries;
 
     // If no assets survived filters (API unreachable or demo with zero volumes),
     // keep current selection unchanged — or fall back to defaults on first run.
@@ -237,6 +250,11 @@ export class FundingRateScanner {
   /** Current top-N asset list (returns a copy). */
   getTopAssets(): string[] {
     return [...this.selected];
+  }
+
+  /** Last full scan entries sorted by composite score (for score-weighted allocation). */
+  getLastScanEntries(): AssetScanEntry[] {
+    return [...this.lastScanEntries];
   }
 
   // ── Scoring helpers ───────────────────────────────────────────────────────────
@@ -296,7 +314,7 @@ export class FundingRateScanner {
     const top = entries.slice(0, 15);
     const lines: string[] = [
       `[SCANNER] ══════════════════════════════════════════════════════════════════`,
-      `  Rank  Asset         APR%  T   CEX±%   Stab   Vol($M)    OI($M)    OI%     Score`,
+      `  Rank  Asset         APR%  T   CEX±%   Stab   Vol($M)    OI($M)    OI%   ATR%    Score`,
     ];
 
     top.forEach((e, i) => {
@@ -312,9 +330,10 @@ export class FundingRateScanner {
       const oi      = (e.openInterestUsd / 1_000_000).toFixed(1).padStart(9);
       const oiSign  = e.oiVelocityPct >= 0 ? '+' : '';
       const oiVel   = `${oiSign}${(e.oiVelocityPct * 100).toFixed(1)}%`.padStart(7);
+      const atrStr  = `${(e.atrPct * 100).toFixed(2)}%`.padStart(6);
       const score   = e.compositeScore.toFixed(3).padStart(9);
       const star    = e.selected ? "  ★" : "";
-      lines.push(`  ${rank}  ${name}  ${apr}%  ${arrow}  ${cexStr.padStart(6)}%  ${stab}  ${vol}  ${oi}  ${oiVel}  ${score}${star}`);
+      lines.push(`  ${rank}  ${name}  ${apr}%  ${arrow}  ${cexStr.padStart(6)}%  ${stab}  ${vol}  ${oi}  ${oiVel}  ${atrStr}  ${score}${star}`);
     });
 
     lines.push(`  Selected:  ${this.selected.join(", ") || "(none)"}`);
