@@ -111,12 +111,20 @@ const AUTO_HALT_LATENCY_SEVERE_EXTRA = parseInt(process.env.AUTO_HALT_LATENCY_SE
 // Position sanity gates for recovery: net delta drift and total exposure caps
 const AUTO_HALT_DELTA_GATE_PCT    = parseFloat(process.env.AUTO_HALT_DELTA_GATE_PCT    ?? "0.05"); // |spot−perp| / max ≤ 5%
 const AUTO_HALT_EXPOSURE_GATE_PCT = parseFloat(process.env.AUTO_HALT_EXPOSURE_GATE_PCT ?? "0.65"); // (spot+perp) / equity ≤ 65%
-// Edge gate: best net funding edge across active assets must exceed this APR after fees
-const AUTO_HALT_MIN_EDGE_APR      = parseFloat(process.env.AUTO_HALT_MIN_EDGE_APR      ?? "0.005"); // 0.5% annual minimum
-const AUTO_HALT_FEE_EST_APR       = parseFloat(process.env.AUTO_HALT_FEE_EST_APR       ?? "0.003"); // ~0.3% annual fee estimate
+// Edge gate: best net funding edge — env vars in APR for human legibility, converted to hourly internally
+const AUTO_HALT_MIN_EDGE_APR      = parseFloat(process.env.AUTO_HALT_MIN_EDGE_APR      ?? "0.005"); // 0.5% APR minimum
+const AUTO_HALT_FEE_EST_APR       = parseFloat(process.env.AUTO_HALT_FEE_EST_APR       ?? "0.003"); // ~0.3% APR fee estimate
 // Correlation gate: if avg pairwise portfolio corr exceeds this, tighten exposure cap
 const AUTO_HALT_CORR_THRESHOLD    = parseFloat(process.env.AUTO_HALT_CORR_THRESHOLD    ?? "0.75");
 const AUTO_HALT_CORR_EXPOSURE_CAP = parseFloat(process.env.AUTO_HALT_CORR_EXPOSURE_CAP ?? "0.50"); // 50% cap during high-corr regimes
+// ATR compression trap: suspiciously low volatility → require extended streak before resume
+const ATR_COMPRESSION_FLOOR           = parseFloat(process.env.ATR_COMPRESSION_FLOOR           ?? "0.003"); // <0.3% btcAtr = suspicious
+const AUTO_HALT_CLEAR_CYCLES_COMPRESSED = parseInt(process.env.AUTO_HALT_CLEAR_CYCLES_COMPRESSED ?? "18"); // 18 × 10s = 3 min
+// Post-halt phased re-entry: ramp exposure gradually after auto-halt lifts
+const POST_HALT_PHASE1_CAP = parseFloat(process.env.POST_HALT_PHASE1_CAP ?? "0.30"); // 30% cap for first 5 min
+const POST_HALT_PHASE2_CAP = parseFloat(process.env.POST_HALT_PHASE2_CAP ?? "0.50"); // 50% cap for 5-15 min
+const POST_HALT_PHASE1_MS  = parseInt(process.env.POST_HALT_PHASE1_MS   ?? String(5  * 60_000)); //  5 min
+const POST_HALT_PHASE2_MS  = parseInt(process.env.POST_HALT_PHASE2_MS   ?? String(15 * 60_000)); // 15 min
 
 const logger = new Logger("./logs");
 
@@ -251,6 +259,9 @@ async function main() {
   let autoHaltClearCount = 0;                       // consecutive stable risk cycles needed before resume
   let autoHaltExtraCooldown = 0;                    // additional cycles locked after severe latency breach
   const autoHaltAtrRing: number[] = [];             // rolling 4-sample BTC ATR for slope check
+  const autoHaltCorrRing: number[] = [];            // rolling 4-sample avgCorr for correlation slope check
+  let postHaltPhase = 0;                            // 0=full, 1=30% cap (0-5min), 2=50% cap (5-15min)
+  let postHaltPhaseStart = 0;                       // timestamp when postHaltPhase was last advanced
   interface PnlCheckpoint { ts: number; pnl: number; }
   const pnlCheckpoints: PnlCheckpoint[] = [];       // rolling PnL history for auto-halt drawdown checks
   let scoreWeightMap: Map<string, number> = new Map(); // score-weighted capital share per asset
@@ -750,7 +761,7 @@ async function main() {
           if (dd24h < -AUTO_HALT_24H_PCT) logger.risk(`[AUTO-HALT] 24h drawdown ${(dd24h * 100).toFixed(2)}% < -${(AUTO_HALT_24H_PCT * 100).toFixed(0)}% — halting new entries`);
           if (latencyBreach && !latencySevere) logger.risk(`[AUTO-HALT] HL latency ${hlLatencyMs}ms > ${AUTO_HALT_HL_LATENCY_MS}ms — halting new entries`);
         } else if (autoHalt) {
-          // ── Compute all recovery gates first (used by both cooldown drain and streak) ──
+          // ── Compute all recovery gates first ─────────────────────────────────
 
           // Gate 5 — position sanity
           const spotExp = Array.from(positions.entries())
@@ -761,14 +772,18 @@ async function main() {
           const netDeltaPct   = Math.abs(spotExp - perpExp) / maxExp;
           const totalExposure = (spotExp + perpExp) / Math.max(vaultEquity, 1);
 
-          // Gate 6 — funding edge: at least one active asset must have net edge > threshold
+          // Gate 6 — funding edge in hourly units (fixes APR/horizon mismatch):
+          //   fundingRate is already per-hour; compare against hourly fee equivalent.
+          //   Env vars stay as APR for human legibility; converted to hourly here.
+          const feeHourly     = AUTO_HALT_FEE_EST_APR / 8760;
+          const minEdgeHourly = AUTO_HALT_MIN_EDGE_APR / 8760;
           const bestEdge = activeAssets.reduce((best, a) => {
             const s = marketEngine.getSnapshot(a);
-            return s ? Math.max(best, Math.abs(s.fundingRate) * 8760 - AUTO_HALT_FEE_EST_APR) : best;
+            return s ? Math.max(best, Math.abs(s.fundingRate) - feeHourly) : best;
           }, 0);
-          const edgeSufficient = bestEdge >= AUTO_HALT_MIN_EDGE_APR;
+          const edgeSufficient = bestEdge >= minEdgeHourly;
 
-          // Gate 7 — portfolio correlation: tighten exposure cap in systemic risk regimes
+          // Gate 7 — portfolio correlation level + slope (prevents re-entry into tightening regimes)
           let corrSum = 0, corrPairs = 0;
           for (let i = 0; i < activeAssets.length; i++) {
             for (let j = i + 1; j < activeAssets.length; j++) {
@@ -780,7 +795,12 @@ async function main() {
             }
           }
           const avgCorr = corrPairs > 0 ? corrSum / corrPairs : 0;
-          // High correlation → tighten exposure cap; still allow recovery, just with tighter portfolio ceiling
+          autoHaltCorrRing.push(avgCorr);
+          if (autoHaltCorrRing.length > 4) autoHaltCorrRing.shift();
+          const corrSlope   = autoHaltCorrRing.length >= 4
+            ? autoHaltCorrRing[autoHaltCorrRing.length - 1] - autoHaltCorrRing[0]
+            : 0;
+          const corrNotRising       = corrSlope <= 0;
           const effectiveExposureCap = avgCorr > AUTO_HALT_CORR_THRESHOLD
             ? AUTO_HALT_CORR_EXPOSURE_CAP
             : AUTO_HALT_EXPOSURE_GATE_PCT;
@@ -793,9 +813,14 @@ async function main() {
 
           const allClear = !latencyBreach && !drawdownBreach
                         && atrNormalized && atrNotRising
-                        && positionsSane && edgeSufficient;
+                        && positionsSane && edgeSufficient && corrNotRising;
 
-          // Fix #2/#4 — drain severe cooldown with variable rate (faster when all gates green)
+          // ATR compression trap: suspiciously low ATR = unstable equilibrium → require longer streak
+          const requiredCycles = btcAtr < ATR_COMPRESSION_FLOOR
+            ? AUTO_HALT_CLEAR_CYCLES_COMPRESSED
+            : AUTO_HALT_CLEAR_CYCLES;
+
+          // Drain severe cooldown with variable rate (faster when all gates green)
           if (autoHaltExtraCooldown > 0) {
             const decayRate = allClear ? 2 : 1;
             autoHaltExtraCooldown = Math.max(0, autoHaltExtraCooldown - decayRate);
@@ -807,30 +832,37 @@ async function main() {
             // ── Recovery streak counter ──────────────────────────────────────
             if (allClear) {
               autoHaltClearCount++;
+              const compressed = requiredCycles > AUTO_HALT_CLEAR_CYCLES ? " [ATR-compressed]" : "";
               logger.info(
-                `[AUTO-HALT] Recovery ${autoHaltClearCount}/${AUTO_HALT_CLEAR_CYCLES}: ` +
-                `latency ✓  drawdown ✓  ATR ✓(slope${atrSlope > 0 ? "+" : ""}${atrSlope.toFixed(4)})  ` +
+                `[AUTO-HALT] Recovery ${autoHaltClearCount}/${requiredCycles}${compressed}: ` +
+                `latency ✓  drawdown ✓  ` +
+                `ATR ✓(slope${atrSlope > 0 ? "+" : ""}${atrSlope.toFixed(4)})  ` +
                 `delta ${(netDeltaPct * 100).toFixed(1)}% ✓  exp ${(totalExposure * 100).toFixed(1)}% ✓  ` +
-                `edge ${(bestEdge * 100).toFixed(2)}% ✓  corr ${avgCorr.toFixed(3)} ✓`
+                `edge ${(bestEdge * 1_000_000 / 100).toFixed(4)}%/hr ✓  ` +
+                `corr ${avgCorr.toFixed(3)}(slope${corrSlope > 0 ? "+" : ""}${corrSlope.toFixed(3)}) ✓`
               );
-              if (autoHaltClearCount >= AUTO_HALT_CLEAR_CYCLES) {
+              if (autoHaltClearCount >= requiredCycles) {
                 autoHalt = false;
                 autoHaltClearCount = 0;
-                logger.info("[AUTO-HALT] Sustained recovery confirmed — auto-halt lifted");
+                // Phased re-entry: cap exposure to 30% for first 5 min, 50% for 5-15 min, then full
+                postHaltPhase = 1;
+                postHaltPhaseStart = Date.now();
+                logger.info(`[AUTO-HALT] Sustained recovery confirmed — entering phased re-entry (phase 1: ${(POST_HALT_PHASE1_CAP * 100).toFixed(0)}% exposure cap)`);
               }
             } else {
               // Any failed gate resets counter — no partial credit
               if (autoHaltClearCount > 0) {
                 const failed = [
-                  latencyBreach                                   && "latency",
-                  drawdownBreach                                  && "drawdown",
-                  !atrNormalized                                  && "ATR-level",
-                  !atrNotRising                                   && "ATR-rising",
-                  netDeltaPct > AUTO_HALT_DELTA_GATE_PCT          && `delta ${(netDeltaPct * 100).toFixed(1)}%`,
-                  totalExposure > effectiveExposureCap            && `exposure ${(totalExposure * 100).toFixed(1)}% (cap ${(effectiveExposureCap * 100).toFixed(0)}% ${avgCorr > AUTO_HALT_CORR_THRESHOLD ? "corr-tightened" : "normal"})`,
-                  !edgeSufficient                                 && `edge ${(bestEdge * 100).toFixed(3)}% < ${(AUTO_HALT_MIN_EDGE_APR * 100).toFixed(2)}%`,
+                  latencyBreach                                    && "latency",
+                  drawdownBreach                                   && "drawdown",
+                  !atrNormalized                                   && "ATR-level",
+                  !atrNotRising                                    && "ATR-rising",
+                  netDeltaPct  > AUTO_HALT_DELTA_GATE_PCT          && `delta ${(netDeltaPct * 100).toFixed(1)}%`,
+                  totalExposure > effectiveExposureCap             && `exposure ${(totalExposure * 100).toFixed(1)}%(cap ${(effectiveExposureCap * 100).toFixed(0)}%${avgCorr > AUTO_HALT_CORR_THRESHOLD ? " corr-tightened" : ""})`,
+                  !edgeSufficient                                  && `edge ${(bestEdge * 1_000_000 / 100).toFixed(4)}%/hr < ${(minEdgeHourly * 1_000_000 / 100).toFixed(4)}%/hr`,
+                  !corrNotRising                                   && `corr rising +${corrSlope.toFixed(3)}`,
                 ].filter(Boolean).join(", ");
-                logger.info(`[AUTO-HALT] Recovery stalled (${failed}) — reset to 0/${AUTO_HALT_CLEAR_CYCLES}`);
+                logger.info(`[AUTO-HALT] Recovery stalled (${failed}) — reset to 0/${requiredCycles}`);
               }
               autoHaltClearCount = 0;
             }
@@ -1020,6 +1052,22 @@ async function main() {
         logDecision(agentDecision);
       }
 
+      // Post-halt phased re-entry: advance phases as time passes
+      if (postHaltPhase > 0) {
+        const elapsed = Date.now() - postHaltPhaseStart;
+        if (postHaltPhase === 1 && elapsed >= POST_HALT_PHASE1_MS) {
+          postHaltPhase = 2;
+          logger.info(`[POST-HALT] Phase 2: exposure cap raised to ${(POST_HALT_PHASE2_CAP * 100).toFixed(0)}%`);
+        } else if (postHaltPhase === 2 && elapsed >= POST_HALT_PHASE2_MS) {
+          postHaltPhase = 0;
+          logger.info("[POST-HALT] Full exposure restored");
+        }
+      }
+      // Phase cap factor: 1.0 normally, reduced during phased re-entry
+      const postHaltFactor = postHaltPhase === 1 ? POST_HALT_PHASE1_CAP
+                           : postHaltPhase === 2 ? POST_HALT_PHASE2_CAP
+                           : 1.0;
+
       // Per-asset strategy
       for (const asset of activeAssets) {
         const snap = marketEngine.getSnapshot(asset);
@@ -1135,7 +1183,7 @@ async function main() {
           finalAllocation = { delta: 0, lending: 1 };
         }
 
-        const capitalPerAsset = totalCapital * (scoreWeightMap.get(asset) ?? 1 / activeAssets.length);
+        const capitalPerAsset = totalCapital * (scoreWeightMap.get(asset) ?? 1 / activeAssets.length) * postHaltFactor;
         // Ensure delta allocation is at least MIN_TRADE_SIZE when signal wants to open
         const rawDeltaCapital = capitalPerAsset * finalAllocation.delta;
         const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(MIN_TRADE_SIZE, rawDeltaCapital));
@@ -1522,6 +1570,8 @@ async function main() {
       botState.tradeHistory = tradeHistory.slice(-100);
       botState.manualHalt   = manualHalt;
       botState.autoHalt     = autoHalt;
+      botState.postHaltPhase = postHaltPhase;
+      botState.postHaltFactor = postHaltFactor;
 
       // ── Organized Logging (gated to every LOG_EVERY_N cycles) ─────────────
       if (shouldLog) {
