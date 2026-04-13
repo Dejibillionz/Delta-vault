@@ -111,6 +111,12 @@ const AUTO_HALT_LATENCY_SEVERE_EXTRA = parseInt(process.env.AUTO_HALT_LATENCY_SE
 // Position sanity gates for recovery: net delta drift and total exposure caps
 const AUTO_HALT_DELTA_GATE_PCT    = parseFloat(process.env.AUTO_HALT_DELTA_GATE_PCT    ?? "0.05"); // |spot−perp| / max ≤ 5%
 const AUTO_HALT_EXPOSURE_GATE_PCT = parseFloat(process.env.AUTO_HALT_EXPOSURE_GATE_PCT ?? "0.65"); // (spot+perp) / equity ≤ 65%
+// Edge gate: best net funding edge across active assets must exceed this APR after fees
+const AUTO_HALT_MIN_EDGE_APR      = parseFloat(process.env.AUTO_HALT_MIN_EDGE_APR      ?? "0.005"); // 0.5% annual minimum
+const AUTO_HALT_FEE_EST_APR       = parseFloat(process.env.AUTO_HALT_FEE_EST_APR       ?? "0.003"); // ~0.3% annual fee estimate
+// Correlation gate: if avg pairwise portfolio corr exceeds this, tighten exposure cap
+const AUTO_HALT_CORR_THRESHOLD    = parseFloat(process.env.AUTO_HALT_CORR_THRESHOLD    ?? "0.75");
+const AUTO_HALT_CORR_EXPOSURE_CAP = parseFloat(process.env.AUTO_HALT_CORR_EXPOSURE_CAP ?? "0.50"); // 50% cap during high-corr regimes
 
 const logger = new Logger("./logs");
 
@@ -744,35 +750,68 @@ async function main() {
           if (dd24h < -AUTO_HALT_24H_PCT) logger.risk(`[AUTO-HALT] 24h drawdown ${(dd24h * 100).toFixed(2)}% < -${(AUTO_HALT_24H_PCT * 100).toFixed(0)}% — halting new entries`);
           if (latencyBreach && !latencySevere) logger.risk(`[AUTO-HALT] HL latency ${hlLatencyMs}ms > ${AUTO_HALT_HL_LATENCY_MS}ms — halting new entries`);
         } else if (autoHalt) {
-          // Fix #2 — drain severe cooldown first (no recovery checks while locked)
+          // ── Compute all recovery gates first (used by both cooldown drain and streak) ──
+
+          // Gate 5 — position sanity
+          const spotExp = Array.from(positions.entries())
+            .filter(([k]) => k.endsWith("_SPOT")).reduce((s, [, p]) => s + (p.quoteAmount ?? 0), 0);
+          const perpExp = Array.from(positions.entries())
+            .filter(([k]) => k.endsWith("_PERP")).reduce((s, [, p]) => s + (p.quoteAmount ?? 0), 0);
+          const maxExp        = Math.max(spotExp, perpExp, 1);
+          const netDeltaPct   = Math.abs(spotExp - perpExp) / maxExp;
+          const totalExposure = (spotExp + perpExp) / Math.max(vaultEquity, 1);
+
+          // Gate 6 — funding edge: at least one active asset must have net edge > threshold
+          const bestEdge = activeAssets.reduce((best, a) => {
+            const s = marketEngine.getSnapshot(a);
+            return s ? Math.max(best, Math.abs(s.fundingRate) * 8760 - AUTO_HALT_FEE_EST_APR) : best;
+          }, 0);
+          const edgeSufficient = bestEdge >= AUTO_HALT_MIN_EDGE_APR;
+
+          // Gate 7 — portfolio correlation: tighten exposure cap in systemic risk regimes
+          let corrSum = 0, corrPairs = 0;
+          for (let i = 0; i < activeAssets.length; i++) {
+            for (let j = i + 1; j < activeAssets.length; j++) {
+              corrSum += Math.abs(pearsonCorr(
+                marketEngine.getPriceReturns(activeAssets[i]),
+                marketEngine.getPriceReturns(activeAssets[j])
+              ));
+              corrPairs++;
+            }
+          }
+          const avgCorr = corrPairs > 0 ? corrSum / corrPairs : 0;
+          // High correlation → tighten exposure cap; still allow recovery, just with tighter portfolio ceiling
+          const effectiveExposureCap = avgCorr > AUTO_HALT_CORR_THRESHOLD
+            ? AUTO_HALT_CORR_EXPOSURE_CAP
+            : AUTO_HALT_EXPOSURE_GATE_PCT;
+
+          const ATR_TARGET    = parseFloat(process.env.ATR_TARGET_VOL_PCT ?? "0.02");
+          const atrNormalized = btcAtr < ATR_TARGET * AUTO_HALT_ATR_RATIO;
+          const atrNotRising  = atrSlope <= 0;
+          const positionsSane = netDeltaPct <= AUTO_HALT_DELTA_GATE_PCT
+                             && totalExposure <= effectiveExposureCap;
+
+          const allClear = !latencyBreach && !drawdownBreach
+                        && atrNormalized && atrNotRising
+                        && positionsSane && edgeSufficient;
+
+          // Fix #2/#4 — drain severe cooldown with variable rate (faster when all gates green)
           if (autoHaltExtraCooldown > 0) {
-            autoHaltExtraCooldown--;
-            logger.info(`[AUTO-HALT] Severe cooldown — ${autoHaltExtraCooldown} extra cycles remaining`);
+            const decayRate = allClear ? 2 : 1;
+            autoHaltExtraCooldown = Math.max(0, autoHaltExtraCooldown - decayRate);
+            logger.info(
+              `[AUTO-HALT] Severe cooldown — ${autoHaltExtraCooldown} extra cycles remaining` +
+              (decayRate === 2 ? " (fast drain — all gates green)" : "")
+            );
           } else {
-            // ── Recovery guard (all gates must pass every cycle) ─────────────
-            const ATR_TARGET      = parseFloat(process.env.ATR_TARGET_VOL_PCT ?? "0.02");
-            const atrNormalized   = btcAtr < ATR_TARGET * AUTO_HALT_ATR_RATIO;
-            const atrNotRising    = atrSlope <= 0; // Fix #1: volatility must not be trending up
-
-            // Fix #3 — position sanity: ensure portfolio is structurally safe to re-enter
-            const spotExp = Array.from(positions.entries())
-              .filter(([k]) => k.endsWith("_SPOT")).reduce((s, [, p]) => s + (p.quoteAmount ?? 0), 0);
-            const perpExp = Array.from(positions.entries())
-              .filter(([k]) => k.endsWith("_PERP")).reduce((s, [, p]) => s + (p.quoteAmount ?? 0), 0);
-            const maxExp        = Math.max(spotExp, perpExp, 1);
-            const netDeltaPct   = Math.abs(spotExp - perpExp) / maxExp;
-            const totalExposure = (spotExp + perpExp) / Math.max(vaultEquity, 1);
-            const positionsSane = netDeltaPct <= AUTO_HALT_DELTA_GATE_PCT
-                                && totalExposure <= AUTO_HALT_EXPOSURE_GATE_PCT;
-
-            const allClear = !latencyBreach && !drawdownBreach
-                          && atrNormalized && atrNotRising && positionsSane;
-
+            // ── Recovery streak counter ──────────────────────────────────────
             if (allClear) {
               autoHaltClearCount++;
               logger.info(
                 `[AUTO-HALT] Recovery ${autoHaltClearCount}/${AUTO_HALT_CLEAR_CYCLES}: ` +
-                `latency ✓  drawdown ✓  ATR ✓ (slope${atrSlope > 0 ? "+" : ""}${atrSlope.toFixed(4)})  delta ${(netDeltaPct * 100).toFixed(1)}% ✓  exposure ${(totalExposure * 100).toFixed(1)}% ✓`
+                `latency ✓  drawdown ✓  ATR ✓(slope${atrSlope > 0 ? "+" : ""}${atrSlope.toFixed(4)})  ` +
+                `delta ${(netDeltaPct * 100).toFixed(1)}% ✓  exp ${(totalExposure * 100).toFixed(1)}% ✓  ` +
+                `edge ${(bestEdge * 100).toFixed(2)}% ✓  corr ${avgCorr.toFixed(3)} ✓`
               );
               if (autoHaltClearCount >= AUTO_HALT_CLEAR_CYCLES) {
                 autoHalt = false;
@@ -783,11 +822,13 @@ async function main() {
               // Any failed gate resets counter — no partial credit
               if (autoHaltClearCount > 0) {
                 const failed = [
-                  latencyBreach  && "latency",
-                  drawdownBreach && "drawdown",
-                  !atrNormalized && "ATR-level",
-                  !atrNotRising  && "ATR-rising",
-                  !positionsSane && `delta ${(netDeltaPct * 100).toFixed(1)}%/exp ${(totalExposure * 100).toFixed(1)}%`,
+                  latencyBreach                                   && "latency",
+                  drawdownBreach                                  && "drawdown",
+                  !atrNormalized                                  && "ATR-level",
+                  !atrNotRising                                   && "ATR-rising",
+                  netDeltaPct > AUTO_HALT_DELTA_GATE_PCT          && `delta ${(netDeltaPct * 100).toFixed(1)}%`,
+                  totalExposure > effectiveExposureCap            && `exposure ${(totalExposure * 100).toFixed(1)}% (cap ${(effectiveExposureCap * 100).toFixed(0)}% ${avgCorr > AUTO_HALT_CORR_THRESHOLD ? "corr-tightened" : "normal"})`,
+                  !edgeSufficient                                 && `edge ${(bestEdge * 100).toFixed(3)}% < ${(AUTO_HALT_MIN_EDGE_APR * 100).toFixed(2)}%`,
                 ].filter(Boolean).join(", ");
                 logger.info(`[AUTO-HALT] Recovery stalled (${failed}) — reset to 0/${AUTO_HALT_CLEAR_CYCLES}`);
               }
