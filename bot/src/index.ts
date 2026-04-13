@@ -101,6 +101,10 @@ const SLIPPAGE_PAUSE_CYCLES = parseInt(process.env.SLIPPAGE_PAUSE_CYCLES ?? "5")
 const AUTO_HALT_1H_PCT        = parseFloat(process.env.AUTO_HALT_1H_PCT         ?? "0.02"); // -2%
 const AUTO_HALT_24H_PCT       = parseFloat(process.env.AUTO_HALT_24H_PCT        ?? "0.05"); // -5%
 const AUTO_HALT_HL_LATENCY_MS = parseFloat(process.env.AUTO_HALT_HL_LATENCY_MS ?? "5000");
+// Recovery guard: all conditions must hold for N consecutive risk cycles (~10s each) before resume
+const AUTO_HALT_CLEAR_CYCLES  = parseInt(process.env.AUTO_HALT_CLEAR_CYCLES    ?? "12");   // 12 × 10s = 2 min
+// ATR recovery gate: BTC price stdDev must be < ATR_TARGET × this ratio before resume
+const AUTO_HALT_ATR_RATIO     = parseFloat(process.env.AUTO_HALT_ATR_RATIO     ?? "1.5"); // 3% baseline × 1.5 = 4.5%
 
 const logger = new Logger("./logs");
 
@@ -232,6 +236,7 @@ async function main() {
   const tradeHistory: TradeRecord[] = [];           // last 100 completed trades
   let manualHalt = false;                           // kill switch — set via POST /admin/halt
   let autoHalt   = false;                           // machine-set — cleared when triggers normalize
+  let autoHaltClearCount = 0;                       // consecutive stable risk cycles needed before resume
   interface PnlCheckpoint { ts: number; pnl: number; }
   const pnlCheckpoints: PnlCheckpoint[] = [];       // rolling PnL history for auto-halt drawdown checks
   let scoreWeightMap: Map<string, number> = new Map(); // score-weighted capital share per asset
@@ -705,17 +710,43 @@ async function main() {
         const dd1h  = cp1h  ? (currentPnl - cp1h.pnl)  / Math.max(vaultEquity, 1) : 0;
         const dd24h = cp24h ? (currentPnl - cp24h.pnl) / Math.max(vaultEquity, 1) : 0;
 
-        const latencyBreach   = hlLatencyMs > AUTO_HALT_HL_LATENCY_MS;
-        const drawdownBreach  = dd1h < -AUTO_HALT_1H_PCT || dd24h < -AUTO_HALT_24H_PCT;
+        // Use BTC ATR as a market-wide volatility proxy
+        const btcAtr = marketEngine.getSnapshot("BTC")?.atrPct ?? 0;
+
+        const latencyBreach  = hlLatencyMs > AUTO_HALT_HL_LATENCY_MS;
+        const drawdownBreach = dd1h < -AUTO_HALT_1H_PCT || dd24h < -AUTO_HALT_24H_PCT;
 
         if ((latencyBreach || drawdownBreach) && !autoHalt) {
+          // ── Trigger ─────────────────────────────────────────────────────────
           autoHalt = true;
-          if (dd1h < -AUTO_HALT_1H_PCT)    logger.risk(`[AUTO-HALT] 1h drawdown ${(dd1h * 100).toFixed(2)}% < -${(AUTO_HALT_1H_PCT * 100).toFixed(0)}% — halting new entries`);
-          if (dd24h < -AUTO_HALT_24H_PCT)  logger.risk(`[AUTO-HALT] 24h drawdown ${(dd24h * 100).toFixed(2)}% < -${(AUTO_HALT_24H_PCT * 100).toFixed(0)}% — halting new entries`);
-          if (latencyBreach)               logger.risk(`[AUTO-HALT] HL latency ${hlLatencyMs}ms > ${AUTO_HALT_HL_LATENCY_MS}ms — halting new entries`);
-        } else if (!latencyBreach && !drawdownBreach && autoHalt) {
-          autoHalt = false;
-          logger.info("[AUTO-HALT] All triggers normalized — auto-halt lifted");
+          autoHaltClearCount = 0;
+          if (dd1h < -AUTO_HALT_1H_PCT)   logger.risk(`[AUTO-HALT] 1h drawdown ${(dd1h * 100).toFixed(2)}% < -${(AUTO_HALT_1H_PCT * 100).toFixed(0)}% — halting new entries`);
+          if (dd24h < -AUTO_HALT_24H_PCT) logger.risk(`[AUTO-HALT] 24h drawdown ${(dd24h * 100).toFixed(2)}% < -${(AUTO_HALT_24H_PCT * 100).toFixed(0)}% — halting new entries`);
+          if (latencyBreach)              logger.risk(`[AUTO-HALT] HL latency ${hlLatencyMs}ms > ${AUTO_HALT_HL_LATENCY_MS}ms — halting new entries`);
+        } else if (autoHalt) {
+          // ── Recovery guard: require sustained stability before auto-resume ──
+          // All three recovery conditions must hold every cycle; any failure resets the counter.
+          const atrNormalized   = btcAtr < (parseFloat(process.env.ATR_TARGET_VOL_PCT ?? "0.02") * AUTO_HALT_ATR_RATIO);
+          const allClear = !latencyBreach && !drawdownBreach && atrNormalized;
+
+          if (allClear) {
+            autoHaltClearCount++;
+            logger.info(`[AUTO-HALT] Recovery check ${autoHaltClearCount}/${AUTO_HALT_CLEAR_CYCLES}: latency ✓  drawdown ✓  ATR ✓`);
+            if (autoHaltClearCount >= AUTO_HALT_CLEAR_CYCLES) {
+              autoHalt = false;
+              autoHaltClearCount = 0;
+              logger.info("[AUTO-HALT] Sustained recovery confirmed — auto-halt lifted");
+            }
+          } else {
+            // One bad sample resets the counter — no partial credit
+            if (autoHaltClearCount > 0) {
+              logger.info(
+                `[AUTO-HALT] Recovery stalled — reset counter (latency:${latencyBreach} dd:${drawdownBreach} atr:${!atrNormalized}) ` +
+                `— back to 0/${AUTO_HALT_CLEAR_CYCLES}`
+              );
+            }
+            autoHaltClearCount = 0;
+          }
         }
       }
 
