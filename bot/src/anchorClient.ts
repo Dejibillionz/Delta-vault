@@ -116,10 +116,8 @@ export class AnchorVaultClient {
       return;
     }
 
-    // anchor 0.31.x: Program(idl, provider) — programId comes from idl.address.
-    // Override idl.address with VAULT_PROGRAM_ID env var if provided.
-    const idlWithAddr = { ...idl, address: this.programId.toBase58() } as Idl;
-    this.program     = new Program(idlWithAddr, this.provider);
+    // Program constructor: 3-arg form compatible with @coral-xyz/anchor 0.29.x
+    this.program     = new Program(idl, this.programId, this.provider);
     this.isAvailable = true;
     this.logger.info(
       `AnchorClient ready — program: ${this.programId.toBase58()}\n` +

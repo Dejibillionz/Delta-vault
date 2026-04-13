@@ -47,9 +47,11 @@ const BASE_SNAP = {
   basisSpread: 0,
   basisUSD: 0,
   openInterest: 500_000,
+  dailyVolumeUsd: 50_000_000,
   longShortRatio: 0.5,
   liquidityScore: 0.9,
   pythConfidence: 0.001,
+  oiChangeRatePct: 0,
 };
 
 test("PARK_CAPITAL when funding near zero", () => {
@@ -121,7 +123,8 @@ console.log("\n── EnhancedRiskEngine ─────────────
 const INITIAL_EQUITY = 10_000;
 const NORMAL_CONDITIONS: MarketConditions = {
   fundingRateVolatility: 0.05,
-  solanaLatencyMs: 100,
+  solanaRpcLatencyMs: 100,
+  hlLatencyMs: 0,
   oracleStalenessS: 5,
 };
 const EMPTY_POSITIONS: any[] = [];
@@ -145,10 +148,10 @@ test("EMERGENCY_CLOSE when drawdown exceeds 10%", () => {
     `Expected EMERGENCY_CLOSE, got ${m.worstAction}`);
 });
 
-test("PAUSE_EXECUTION on high RPC latency", () => {
+test("PAUSE_EXECUTION on high HL latency", () => {
   const re = freshRisk();
   const m = re.assess(INITIAL_EQUITY, INITIAL_EQUITY * 1.25, EMPTY_POSITIONS, {
-    ...NORMAL_CONDITIONS, solanaLatencyMs: 600,
+    ...NORMAL_CONDITIONS, hlLatencyMs: 2500,
   });
   assert.ok(
     ["PAUSE_EXECUTION", "EMERGENCY_CLOSE"].includes(m.worstAction),
