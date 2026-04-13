@@ -631,6 +631,68 @@ test("ACCUMULATION + persistence in upper dead band (0.62 > 0.59) — regime che
   // Confirm: persistence 0.62 > 0.59 threshold → sizing override in index.ts gives full size
   assert.ok(0.62 > 0.59, "override threshold 0.59 is satisfied — full size applies in index.ts");
 });
+
+// ── FRC Refinements (v3): PEAK_EARLY bias, spike override, context-aware cooldown ─
+console.log("\n── FRC Refinements (v3) ─────────────────────────────────────");
+
+// ── Refinement v3-1: PEAK_EARLY effectiveScore bias ──────────────────────
+test("v3 PEAK_EARLY bias: effectiveScore = min(1, exitScoreSmoothed + 0.1)", () => {
+  const frc = new FundingRegimeClassifier();
+  // 6 alternating cycles build mean=0.00015, std=0.0001
+  for (let i = 0; i < 6; i++) {
+    frc.update("BTC", frcSnap({ fundingRate: i % 2 === 0 ? 0.00005 : 0.00025 }), 0.7);
+  }
+  // Push 0.00034: z≈1.43 (PEAK_EARLY zone), f_accel < 0 (slope drops from 0.00004 → 0.000018)
+  const snapPE = frcSnap({ fundingRate: 0.00034, oiChangeRatePct: 0.01 });
+  const r = frc.update("BTC", snapPE, 0.7);
+  assert.strictEqual(r.regime, "PEAK_EARLY",
+    `Expected PEAK_EARLY, got ${r.regime} (z=${r.f_z.toFixed(2)}, accel=${r.f_accel.toExponential(2)})`);
+
+  const exit = frc.getExitSignal("BTC", snapPE, { persistenceScore: 0.7 } as any);
+  const expectedEff = Math.min(1, exit.exitScoreSmoothed + 0.1);
+  assert.strictEqual(exit.effectiveScore, expectedEff,
+    `effectiveScore ${exit.effectiveScore.toFixed(4)} ≠ exitSmoothed+0.1 = ${expectedEff.toFixed(4)}`);
+  assert.ok(exit.effectiveScore > exit.exitScoreSmoothed,
+    "effectiveScore must exceed exitScoreSmoothed in PEAK_EARLY");
+});
+
+// ── Refinement v3-2: spikeOverride + effectiveScore fields exist ──────────
+test("v3 ExitSignal interface: spikeOverride and effectiveScore fields are present", () => {
+  const frc = new FundingRegimeClassifier();
+  const snap = frcSnap({ fundingRate: 0.0001, oiChangeRatePct: 0.03 });
+  frc.update("BTC", snap, 0.7);
+  const exit = frc.getExitSignal("BTC", snap, { persistenceScore: 0.7 } as any);
+
+  assert.ok(typeof exit.spikeOverride === "boolean", "spikeOverride must be boolean");
+  assert.ok(typeof exit.effectiveScore === "number", "effectiveScore must be number");
+  assert.ok(typeof exit.exitScoreSmoothed === "number", "exitScoreSmoothed must be number");
+  // Under stable conditions: no spike override, effectiveScore equals exitScoreSmoothed
+  assert.strictEqual(exit.spikeOverride, false, "spikeOverride must be false under normal conditions");
+  assert.strictEqual(exit.effectiveScore, exit.exitScoreSmoothed,
+    "effectiveScore must equal exitScoreSmoothed when not in PEAK_EARLY");
+});
+
+// ── Refinement v3-3: context-aware cooldown (3 cycles for moderate score) ─
+test("v3 context-aware cooldown: moderate raw exitScore (<0.65) sets 3-cycle cooldown", () => {
+  const frc = new FundingRegimeClassifier();
+  // From v2 test: f_slope < 0 + persistence drop → exitScore ≈ 0.55 (< 0.65 threshold)
+  const snap1 = frcSnap({ fundingRate: 0.0003, oiChangeRatePct: 0.03 });
+  const snap2 = frcSnap({ fundingRate: 0.0001, oiChangeRatePct: 0.03 }); // negative slope
+  frc.update("BTC", snap1, 0.8);
+  frc.update("BTC", snap2, 0.5); // persistence drops 0.3 → persistenceDrop = 1.0
+  const exit = frc.getExitSignal("BTC", snap2, { persistenceScore: 0.5 } as any);
+  if (exit.action === "REDUCE_50") {
+    // Verify the cooldown is correctly set according to the raw exitScore
+    const expectedCd = exit.exitScore >= 0.65 ? 5 : 3;
+    assert.strictEqual(frc.getReduceCooldown("BTC"), expectedCd,
+      `cooldown ${frc.getReduceCooldown("BTC")} ≠ expected ${expectedCd} for raw score ${exit.exitScore.toFixed(3)}`);
+    // The raw score from this setup is below 0.65, so expect 3
+    assert.ok(exit.exitScore < 0.65,
+      `raw exitScore ${exit.exitScore.toFixed(3)} should be < 0.65 for this setup`);
+    assert.strictEqual(frc.getReduceCooldown("BTC"), 3,
+      `moderate raw score (${exit.exitScore.toFixed(3)} < 0.65) must set 3-cycle cooldown`);
+  }
+});
 console.log(`\n${"─".repeat(52)}`);
 console.log(`  ${passed} passed   ${failed} failed   ${passed + failed} total`);
 console.log(`${"─".repeat(52)}\n`);

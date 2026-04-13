@@ -43,6 +43,12 @@ const ETM_OI_NORM            = parseFloat(process.env.ETM_OI_NORM            ?? 
 
 // Reduce cooldown: cycles to block re-entry after REDUCE_50
 const FRC_REDUCE_COOLDOWN_CYCLES = parseInt(process.env.FRC_REDUCE_COOLDOWN_CYCLES ?? "3");
+const FRC_REDUCE_COOLDOWN_LONG   = parseInt(process.env.FRC_REDUCE_COOLDOWN_LONG   ?? "5"); // used when raw score is strong
+
+// ETM v3 refinements
+const ETM_PEAK_EARLY_BIAS       = parseFloat(process.env.ETM_PEAK_EARLY_BIAS       ?? "0.1");  // soft exit pressure in PEAK_EARLY
+const ETM_SPIKE_OVERRIDE_THRESH = parseFloat(process.env.ETM_SPIKE_OVERRIDE_THRESH ?? "0.9");  // raw score above this bypasses EMA
+const ETM_COOLDOWN_LONG_THRESH  = parseFloat(process.env.ETM_COOLDOWN_LONG_THRESH  ?? "0.65"); // raw score above this → long cooldown
 
 // ── Types ───────────────────────────────────────────────────────────────────
 export type FundingRegime =
@@ -63,8 +69,10 @@ export interface RegimeResult {
 }
 
 export interface ExitSignal {
-  exitScore:         number;  // raw score [0, 1]
-  exitScoreSmoothed: number;  // EMA-smoothed score [0, 1] — this drives action
+  exitScore:         number;  // raw weighted score [0, 1]
+  exitScoreSmoothed: number;  // EMA-smoothed score [0, 1]
+  effectiveScore:    number;  // smoothed + PEAK_EARLY bias — what actually drives action
+  spikeOverride:     boolean; // true when raw > ETM_SPIKE_OVERRIDE_THRESH (EMA bypassed)
   action:            ExitAction;
   components: {
     negSlope:        number;
@@ -174,34 +182,50 @@ export class FundingRegimeClassifier {
       0.20 * overextended
     );
 
-    // ── EMA smoothing: α=0.2 (~75s effective window at 15s cycles) ───────
+    // ── Spike override: raw > 0.9 bypasses EMA lag on sharp reversals ────
+    const spikeOverride = exitScore > ETM_SPIKE_OVERRIDE_THRESH;
+
+    // ── EMA smoothing: always updated so history reflects true signal ─────
     const prevEMA = this.exitScoreEMA.get(asset) ?? exitScore;
     const exitScoreSmoothed = ETM_EMA_ALPHA * exitScore + (1 - ETM_EMA_ALPHA) * prevEMA;
     this.exitScoreEMA.set(asset, exitScoreSmoothed);
 
-    // ── Action: DECAY always → FULL_EXIT; otherwise use smoothed score ───
+    // ── PEAK_EARLY soft bias: +0.1 nudge toward de-risking ───────────────
+    const effectiveScore = regime === "PEAK_EARLY"
+      ? Math.min(1, exitScoreSmoothed + ETM_PEAK_EARLY_BIAS)
+      : exitScoreSmoothed;
+
+    // ── Action: DECAY / spike → FULL_EXIT; otherwise use effectiveScore ──
     const action: ExitAction =
-      regime === "DECAY"                         ? "FULL_EXIT" :
-      exitScoreSmoothed >= ETM_EXIT_FULL         ? "FULL_EXIT" :
-      exitScoreSmoothed >= ETM_EXIT_PARTIAL      ? "REDUCE_50" :
+      regime === "DECAY"                          ? "FULL_EXIT" :
+      spikeOverride                               ? "FULL_EXIT" :
+      effectiveScore >= ETM_EXIT_FULL             ? "FULL_EXIT" :
+      effectiveScore >= ETM_EXIT_PARTIAL          ? "REDUCE_50" :
       "HOLD";
 
-    // Set cooldown when reducing — blocks re-entry for N cycles
+    // ── Context-aware cooldown: stronger raw signal → longer stabilization ─
     if (action === "REDUCE_50") {
-      this.reduceCooldown.set(asset, FRC_REDUCE_COOLDOWN_CYCLES);
+      const cooldown = exitScore >= ETM_COOLDOWN_LONG_THRESH
+        ? FRC_REDUCE_COOLDOWN_LONG   // 5 cycles when raw score is elevated
+        : FRC_REDUCE_COOLDOWN_CYCLES; // 3 cycles for moderate reduction
+      this.reduceCooldown.set(asset, cooldown);
     }
 
-    // ── Reason string ────────────────────────────────────────────────────
+    // ── Reason string ─────────────────────────────────────────────────────
     const parts: string[] = [];
-    if (regime === "DECAY")       parts.push("regime=DECAY");
-    if (negSlope > 0.5)           parts.push(`slope↓${negSlope.toFixed(2)}`);
-    if (negOi > 0.5)              parts.push(`OI↓${negOi.toFixed(2)}`);
-    if (persistenceDrop > 0.5)    parts.push(`persist↓${rawDrop.toFixed(2)}`);
-    if (overextended > 0.5)       parts.push(`z=${f_z.toFixed(1)}`);
+    if (regime === "DECAY")        parts.push("regime=DECAY");
+    if (spikeOverride)             parts.push(`spike(raw=${exitScore.toFixed(2)})`);
+    if (regime === "PEAK_EARLY")   parts.push(`PEAK_EARLY+${ETM_PEAK_EARLY_BIAS}`);
+    if (negSlope > 0.5)            parts.push(`slope↓${negSlope.toFixed(2)}`);
+    if (negOi > 0.5)               parts.push(`OI↓${negOi.toFixed(2)}`);
+    if (persistenceDrop > 0.5)     parts.push(`persist↓${rawDrop.toFixed(2)}`);
+    if (overextended > 0.5)        parts.push(`z=${f_z.toFixed(1)}`);
 
     return {
       exitScore,
       exitScoreSmoothed,
+      effectiveScore,
+      spikeOverride,
       action,
       components: { negSlope, negOi, persistenceDrop, overextended },
       reason: parts.join(", ") || "stable",

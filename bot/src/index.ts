@@ -132,6 +132,7 @@ const FPP_MIN_PERSISTENCE  = parseFloat(process.env.FPP_MIN_PERSISTENCE  ?? "0.4
 const FPP_SIZING_FLOOR     = parseFloat(process.env.FPP_SIZING_FLOOR     ?? "0.50"); // sizing floor: 50% + 50%×score
 // Funding Regime Classifier + Exit Timing Model
 const FRC_PERSIST_FULL_SIZE_OVERRIDE = parseFloat(process.env.FRC_PERSIST_FULL_SIZE_OVERRIDE ?? "0.59"); // ACCUMULATION full-size when persistence is in upper dead-band (0.59–0.65)
+const FRC_PERSIST_OVERRIDE_EXIT      = parseFloat(process.env.FRC_EXPANSION_EXIT             ?? "0.55"); // hysteresis: deactivate override when persistence drops below this
 const ETM_EXIT_FULL    = parseFloat(process.env.ETM_EXIT_FULL    ?? "0.7");
 const ETM_EXIT_PARTIAL = parseFloat(process.env.ETM_EXIT_PARTIAL ?? "0.5");
 
@@ -229,6 +230,8 @@ async function main() {
   const scanner = new FundingRateScanner(marketEngine, logger, undefined, cexRates);
   const fpp     = new FundingPersistencePredictor();
   const frc     = new FundingRegimeClassifier();
+  const prevRegimeMap           = new Map<string, string>(); // for regime transition logging
+  const persistenceOverrideActive = new Map<string, boolean>(); // hysteresis for ACCUMULATION override
   let activeAssets: string[] = [...TRADING_ASSETS];
   const drainingAssets       = new Set<string>();
   const drainEntryTimes      = new Map<string, number>();
@@ -1090,6 +1093,16 @@ async function main() {
         // Update Funding Regime Classifier — uses persistenceScore from FPP
         const regimeResult = frc.update(asset, snap, fppResult.persistenceScore);
 
+        // Regime transition logging (v3 refinement #5)
+        const prevRegime = prevRegimeMap.get(asset);
+        if (prevRegime !== undefined && prevRegime !== regimeResult.regime) {
+          logger.info(
+            `[FRC] ${asset}: regime transition ${prevRegime} → ${regimeResult.regime} | ` +
+            `persistence=${fppResult.persistenceScore.toFixed(3)} | z=${regimeResult.f_z.toFixed(2)}`
+          );
+        }
+        prevRegimeMap.set(asset, regimeResult.regime);
+
         // Store market data for logging
         marketData[asset] = {
           price: snap.spotPrice,
@@ -1137,7 +1150,7 @@ async function main() {
           const frcExit = frc.getExitSignal(asset, snap, fppResult);
           if (frcExit.action !== "HOLD") {
             const label = frcExit.action === "REDUCE_50" ? "REDUCE_50" : "FULL_EXIT";
-            logger.info(`[FRC] ${asset}: ${label} (score=${frcExit.exitScore.toFixed(2)}) — ${frcExit.reason}`);
+            logger.info(`[FRC] ${asset}: ${label} (effective=${frcExit.effectiveScore.toFixed(2)} raw=${frcExit.exitScore.toFixed(2)}) — ${frcExit.reason}`);
             signal = {
               asset,
               signal: currentState === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL_CLOSE" : "BASIS_TRADE_CLOSE",
@@ -1227,10 +1240,19 @@ async function main() {
         // weak-but-passing trades get proportionally less (never drops below floor × capital)
         const persistenceSizingMult = FPP_SIZING_FLOOR + (1 - FPP_SIZING_FLOOR) * fppResult.persistenceScore;
         // Regime sizing: ACCUMULATION = half size (early, unconfirmed); EXPANSION = full size
-        // Override: strong persistence (> 0.75) in ACCUMULATION earns full size — strong early trend
+        // Override with hysteresis: activate at persistence > 0.59, deactivate below 0.55 (mirrors FRC_EXPANSION_EXIT)
+        if (regimeResult.regime === "ACCUMULATION") {
+          if (fppResult.persistenceScore > FRC_PERSIST_FULL_SIZE_OVERRIDE && !persistenceOverrideActive.get(asset)) {
+            persistenceOverrideActive.set(asset, true);
+          } else if (fppResult.persistenceScore < FRC_PERSIST_OVERRIDE_EXIT && persistenceOverrideActive.get(asset)) {
+            persistenceOverrideActive.set(asset, false);
+          }
+        } else {
+          persistenceOverrideActive.set(asset, false); // reset when outside ACCUMULATION
+        }
         const regimeSizingMult  =
-          regimeResult.regime === "ACCUMULATION" && fppResult.persistenceScore > FRC_PERSIST_FULL_SIZE_OVERRIDE
-            ? 1.0   // override: don't under-size a high-confidence early entry
+          regimeResult.regime === "ACCUMULATION" && persistenceOverrideActive.get(asset)
+            ? 1.0   // override: high-confidence early entry earns full size
             : regimeResult.regime === "ACCUMULATION"
             ? 0.5
             : 1.0;
