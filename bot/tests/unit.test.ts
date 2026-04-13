@@ -13,6 +13,7 @@ import { getPositionSize } from "../src/agent/sizing";
 import { createInitialState } from "../src/agent/state";
 import { Logger } from "../src/logger";
 import { FundingPersistencePredictor } from "../src/services/fundingPersistence";
+import { FundingRegimeClassifier }      from "../src/services/fundingRegime";
 
 // ── Test harness ──────────────────────────────────────────────────────────────
 let passed = 0;
@@ -374,6 +375,140 @@ test("bestEffectiveEdge picks max across assets", () => {
 test("getLatestResult returns null before first update", () => {
   const fpp = new FundingPersistencePredictor();
   assert.strictEqual(fpp.getLatestResult("BTC"), null);
+});
+
+// ── FundingRegimeClassifier + ExitTimingModel tests ───────────────────────────
+console.log("\n── FundingRegimeClassifier ─────────────────────────────────────");
+
+/**
+ * Helper: build a snap with overrides for FRC-relevant fields.
+ * Spreads BASE_SNAP so all LiveMarketSnapshot fields are present.
+ */
+function frcSnap(overrides: {
+  fundingRate?: number;
+  oiChangeRatePct?: number;
+  atrPct?: number;
+}) {
+  return {
+    ...BASE_SNAP,
+    fundingRate:     overrides.fundingRate     ?? 0.0001,
+    oiChangeRatePct: overrides.oiChangeRatePct ?? 0.03,
+    atrPct:          overrides.atrPct          ?? 0.01,
+  };
+}
+
+test("ACCUMULATION: rising funding + positive OI + low persistence", () => {
+  const frc = new FundingRegimeClassifier();
+  const snap = frcSnap({ oiChangeRatePct: 0.03 });
+  frc.update("BTC", { ...snap, fundingRate: 0.00005 }, 0.4); // baseline
+  const r = frc.update("BTC", { ...snap, fundingRate: 0.0001 }, 0.4); // rising → positive slope
+  assert.strictEqual(r.regime, "ACCUMULATION",
+    `Expected ACCUMULATION, got ${r.regime}`);
+  assert.ok(r.f_slope > 0, "slope must be positive");
+});
+
+test("EXPANSION: rising funding + positive OI + high persistence", () => {
+  const frc = new FundingRegimeClassifier();
+  const snap = frcSnap({ oiChangeRatePct: 0.03 });
+  frc.update("BTC", { ...snap, fundingRate: 0.00005 }, 0.7); // baseline
+  const r = frc.update("BTC", { ...snap, fundingRate: 0.0001 }, 0.7); // same slope, high persistence
+  assert.strictEqual(r.regime, "EXPANSION",
+    `Expected EXPANSION, got ${r.regime}`);
+});
+
+test("DECAY: declining funding + negative OI → DECAY", () => {
+  const frc = new FundingRegimeClassifier();
+  // Build high-funding baseline
+  const highSnap = frcSnap({ fundingRate: 0.003, oiChangeRatePct: 0.03 });
+  for (let i = 0; i < 5; i++) frc.update("BTC", highSnap, 0.8);
+  // Then drop sharply with OI unwinding → f_slope < 0, oi_slope < 0
+  const r = frc.update("BTC", frcSnap({ fundingRate: 0.001, oiChangeRatePct: -0.05 }), 0.5);
+  assert.strictEqual(r.regime, "DECAY",
+    `Expected DECAY, got ${r.regime} (slope=${r.f_slope.toExponential(2)})`);
+  assert.ok(r.f_slope < 0, "slope must be negative in DECAY");
+});
+
+test("PEAK: high z-score + flat slope → PEAK", () => {
+  const frc = new FundingRegimeClassifier();
+  // 14 low-rate samples (build a low mean), then 6 high-rate samples
+  // After 20 samples: f_slope = (high − high) / 5 = 0 ≤ 0; z-score ≈ 1.53 > 1.5
+  for (let i = 0; i < 14; i++) frc.update("BTC", frcSnap({ fundingRate: 0.00001, oiChangeRatePct: 0.01 }), 0.7);
+  let r: any;
+  for (let i = 0; i < 6; i++) r = frc.update("BTC", frcSnap({ fundingRate: 0.003,   oiChangeRatePct: 0.01 }), 0.7);
+  assert.strictEqual(r.regime, "PEAK",
+    `Expected PEAK, got ${r.regime} (f_z=${r.f_z.toFixed(3)}, slope=${r.f_slope.toExponential(2)})`);
+  assert.ok(r.f_z > 1.5, `f_z must be > 1.5, got ${r.f_z.toFixed(3)}`);
+});
+
+test("RESET: rising funding but falling OI → RESET (no EXPANSION/ACCUMULATION)", () => {
+  const frc = new FundingRegimeClassifier();
+  frc.update("BTC", frcSnap({ fundingRate: 0.0001, oiChangeRatePct: -0.03 }), 0.5); // baseline
+  const r = frc.update("BTC", frcSnap({ fundingRate: 0.0002, oiChangeRatePct: -0.03 }), 0.5); // rising f, falling OI
+  assert.strictEqual(r.regime, "RESET",
+    `Expected RESET (OI falling blocks ACCUMULATION/EXPANSION), got ${r.regime}`);
+});
+
+test("getLatestRegime returns null before first update", () => {
+  const frc = new FundingRegimeClassifier();
+  assert.strictEqual(frc.getLatestRegime("BTC"), null);
+});
+
+test("getLatestRegime returns result after update without re-running", () => {
+  const frc = new FundingRegimeClassifier();
+  frc.update("BTC", frcSnap({}), 0.7);
+  const r = frc.getLatestRegime("BTC");
+  assert.ok(r !== null, "should return result after update");
+  assert.ok(typeof r!.regime === "string", "regime must be a string");
+  assert.ok(typeof r!.f_z   === "number", "f_z must be a number");
+});
+
+test("getExitSignal → HOLD on healthy EXPANSION conditions", () => {
+  const frc = new FundingRegimeClassifier();
+  const fpp = new FundingPersistencePredictor();
+  const base = frcSnap({ oiChangeRatePct: 0.03 });
+  // Feed rising rates so f_slope > 0 → EXPANSION with persistenceScore=0.75
+  const rates = [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006];
+  let fppResult: any;
+  let r: any;
+  for (const rate of rates) {
+    const s = { ...base, fundingRate: rate };
+    r = frc.update("BTC", s, 0.75);
+    fppResult = fpp.update("BTC", s);
+  }
+  assert.strictEqual(r.regime, "EXPANSION",
+    `Prerequisite: expected EXPANSION, got ${r.regime} (slope=${r.f_slope.toExponential(2)}, z=${r.f_z.toFixed(2)})`);
+  const exit = frc.getExitSignal("BTC", { ...base, fundingRate: 0.0006 }, fppResult);
+  assert.strictEqual(exit.action, "HOLD",
+    `Expected HOLD on healthy expansion, got ${exit.action} (score=${exit.exitScore.toFixed(2)})`);
+});
+
+test("getExitSignal → FULL_EXIT when regime is DECAY", () => {
+  const frc = new FundingRegimeClassifier();
+  const fpp = new FundingPersistencePredictor();
+  // Drive to DECAY
+  const hiSnap = frcSnap({ fundingRate: 0.003, oiChangeRatePct: 0.03 });
+  for (let i = 0; i < 5; i++) { frc.update("BTC", hiSnap, 0.8); fpp.update("BTC", hiSnap); }
+  const decaySnap = frcSnap({ fundingRate: 0.001, oiChangeRatePct: -0.05 });
+  frc.update("BTC", decaySnap, 0.5);
+  const fppResult = fpp.update("BTC", decaySnap);
+  const exit = frc.getExitSignal("BTC", decaySnap, fppResult);
+  assert.strictEqual(exit.action, "FULL_EXIT",
+    `Expected FULL_EXIT for DECAY regime, got ${exit.action}`);
+});
+
+test("getExitSignal components are all in [0, 1]", () => {
+  const frc = new FundingRegimeClassifier();
+  const fpp = new FundingPersistencePredictor();
+  const snap = frcSnap({ fundingRate: 0.0002, oiChangeRatePct: -0.08, atrPct: 0.04 });
+  frc.update("BTC", snap, 0.3);
+  const fppResult = fpp.update("BTC", snap);
+  const exit = frc.getExitSignal("BTC", snap, fppResult);
+  const { negSlope, negOi, persistenceDrop, overextended } = exit.components;
+  assert.ok(negSlope      >= 0 && negSlope      <= 1, `negSlope ${negSlope} out of [0,1]`);
+  assert.ok(negOi         >= 0 && negOi         <= 1, `negOi ${negOi} out of [0,1]`);
+  assert.ok(persistenceDrop >= 0 && persistenceDrop <= 1, `persistenceDrop ${persistenceDrop} out of [0,1]`);
+  assert.ok(overextended  >= 0 && overextended  <= 1, `overextended ${overextended} out of [0,1]`);
+  assert.ok(exit.exitScore >= 0 && exit.exitScore <= 1, `exitScore ${exit.exitScore} out of [0,1]`);
 });
 
 // ── Results ───────────────────────────────────────────────────────────────────

@@ -46,6 +46,7 @@ import { CexFundingRates }                           from "./services/cexFunding
 import { FundingSettlementTimer }                    from "./services/fundingSettlementTimer";
 import { BybitExecutor }                             from "./services/bybitExecution";
 import { FundingPersistencePredictor }               from "./services/fundingPersistence";
+import { FundingRegimeClassifier }                    from "./services/fundingRegime";
 
 // Cross-chain imports
 import { getCrossChainFunding }                       from "./services/crossChainFunding";
@@ -129,6 +130,10 @@ const POST_HALT_PHASE2_MS  = parseInt(process.env.POST_HALT_PHASE2_MS   ?? Strin
 // Funding Persistence Predictor thresholds
 const FPP_MIN_PERSISTENCE  = parseFloat(process.env.FPP_MIN_PERSISTENCE  ?? "0.45"); // block entry below this
 const FPP_SIZING_FLOOR     = parseFloat(process.env.FPP_SIZING_FLOOR     ?? "0.50"); // sizing floor: 50% + 50%×score
+// Funding Regime Classifier + Exit Timing Model
+const FRC_EXPANSION_MIN_PERSIST = parseFloat(process.env.FRC_EXPANSION_MIN_PERSIST ?? "0.6");
+const ETM_EXIT_FULL   = parseFloat(process.env.ETM_EXIT_FULL   ?? "0.7");
+const ETM_EXIT_PARTIAL = parseFloat(process.env.ETM_EXIT_PARTIAL ?? "0.5");
 
 const logger = new Logger("./logs");
 
@@ -223,6 +228,7 @@ async function main() {
   const settlementTimer = new FundingSettlementTimer(marketEngine);
   const scanner = new FundingRateScanner(marketEngine, logger, undefined, cexRates);
   const fpp     = new FundingPersistencePredictor();
+  const frc     = new FundingRegimeClassifier();
   let activeAssets: string[] = [...TRADING_ASSETS];
   const drainingAssets       = new Set<string>();
   const drainEntryTimes      = new Map<string, number>();
@@ -1080,7 +1086,9 @@ async function main() {
         if (!snap) { logger.warn(`${asset}: no snapshot`); continue; }
 
         // Update Funding Persistence Predictor — must run every cycle before any gates
-        const fppResult = fpp.update(asset, snap);
+        const fppResult    = fpp.update(asset, snap);
+        // Update Funding Regime Classifier — uses persistenceScore from FPP
+        const regimeResult = frc.update(asset, snap, fppResult.persistenceScore);
 
         // Store market data for logging
         marketData[asset] = {
@@ -1123,6 +1131,27 @@ async function main() {
             const cycleYield = (perpPos.quoteAmount ?? 0) * Math.abs(snap.fundingRate) / 240; // 15s = 1/240 hour
             perpPos.fundingAccrued = (perpPos.fundingAccrued ?? 0) + cycleYield;
             perpPos.unrealizedPnl  = perpPos.fundingAccrued;
+          }
+
+          // FRC exit signal: checks regime + exit score before strategy engine does
+          const frcExit = frc.getExitSignal(asset, snap, fppResult);
+          if (frcExit.action !== "HOLD") {
+            const label = frcExit.action === "REDUCE_50" ? "REDUCE_50" : "FULL_EXIT";
+            logger.info(`[FRC] ${asset}: ${label} (score=${frcExit.exitScore.toFixed(2)}) — ${frcExit.reason}`);
+            signal = {
+              asset,
+              signal: currentState === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL_CLOSE" : "BASIS_TRADE_CLOSE",
+              reason: `FRC ${label}: ${frcExit.reason}`,
+              urgency: "HIGH",
+              suggestedSizeUSD: 0,
+              metadata: {
+                fundingRate: snap.fundingRate,
+                basisSpread: snap.basisSpread,
+                spotPrice: snap.spotPrice,
+                perpPrice: snap.perpPrice,
+                liquidityScore: snap.liquidityScore,
+              },
+            };
           }
 
           // Get entry funding rate from strategy engine
@@ -1197,7 +1226,9 @@ async function main() {
         // Scale by persistence: floor at FPP_SIZING_FLOOR so fully-persistent trades get full size,
         // weak-but-passing trades get proportionally less (never drops below floor × capital)
         const persistenceSizingMult = FPP_SIZING_FLOOR + (1 - FPP_SIZING_FLOOR) * fppResult.persistenceScore;
-        const rawDeltaCapital = capitalPerAsset * finalAllocation.delta * persistenceSizingMult;
+        // Regime sizing: ACCUMULATION = half size (early, unconfirmed); EXPANSION = full size
+        const regimeSizingMult  = regimeResult.regime === "ACCUMULATION" ? 0.5 : 1.0;
+        const rawDeltaCapital = capitalPerAsset * finalAllocation.delta * persistenceSizingMult * regimeSizingMult;
         const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(MIN_TRADE_SIZE, rawDeltaCapital));
         plannedLendingByAsset[asset] = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset - deltaCapitalAsset));
 
@@ -1228,6 +1259,11 @@ async function main() {
         } else if (isOpenSignal && SCANNER_ENABLED && scanner.getTrend(asset).direction === 'falling') {
           // Trend gate: block entry when funding EWMA trend is falling
           executionData.events.push(`${asset}: funding trend falling (↓) — holding entry, waiting for reversal`);
+        } else if (isOpenSignal && (regimeResult.regime === "PEAK" || regimeResult.regime === "DECAY" || regimeResult.regime === "RESET")) {
+          // Regime gate: only enter during EXPANSION or ACCUMULATION
+          executionData.events.push(
+            `${asset}: regime=${regimeResult.regime} (z=${regimeResult.f_z.toFixed(1)}) — entry blocked, waiting for ACCUMULATION/EXPANSION`
+          );
         } else if (isOpenSignal && fppResult.persistenceScore < FPP_MIN_PERSISTENCE) {
           // FPP gate: funding edge not expected to persist long enough
           const { persistenceScore, expectedEdge, filters } = fppResult;
