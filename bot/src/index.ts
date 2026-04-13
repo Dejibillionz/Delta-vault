@@ -105,6 +105,12 @@ const AUTO_HALT_HL_LATENCY_MS = parseFloat(process.env.AUTO_HALT_HL_LATENCY_MS ?
 const AUTO_HALT_CLEAR_CYCLES  = parseInt(process.env.AUTO_HALT_CLEAR_CYCLES    ?? "12");   // 12 × 10s = 2 min
 // ATR recovery gate: BTC price stdDev must be < ATR_TARGET × this ratio before resume
 const AUTO_HALT_ATR_RATIO     = parseFloat(process.env.AUTO_HALT_ATR_RATIO     ?? "1.5"); // 3% baseline × 1.5 = 4.5%
+// Latency severity: breaches above this multiple of the threshold trigger extended cooldown
+const AUTO_HALT_LATENCY_SEVERE_MULT  = parseFloat(process.env.AUTO_HALT_LATENCY_SEVERE_MULT  ?? "2.0");
+const AUTO_HALT_LATENCY_SEVERE_EXTRA = parseInt(process.env.AUTO_HALT_LATENCY_SEVERE_EXTRA   ?? "6");  // +6 × 10s = +1 min
+// Position sanity gates for recovery: net delta drift and total exposure caps
+const AUTO_HALT_DELTA_GATE_PCT    = parseFloat(process.env.AUTO_HALT_DELTA_GATE_PCT    ?? "0.05"); // |spot−perp| / max ≤ 5%
+const AUTO_HALT_EXPOSURE_GATE_PCT = parseFloat(process.env.AUTO_HALT_EXPOSURE_GATE_PCT ?? "0.65"); // (spot+perp) / equity ≤ 65%
 
 const logger = new Logger("./logs");
 
@@ -237,6 +243,8 @@ async function main() {
   let manualHalt = false;                           // kill switch — set via POST /admin/halt
   let autoHalt   = false;                           // machine-set — cleared when triggers normalize
   let autoHaltClearCount = 0;                       // consecutive stable risk cycles needed before resume
+  let autoHaltExtraCooldown = 0;                    // additional cycles locked after severe latency breach
+  const autoHaltAtrRing: number[] = [];             // rolling 4-sample BTC ATR for slope check
   interface PnlCheckpoint { ts: number; pnl: number; }
   const pnlCheckpoints: PnlCheckpoint[] = [];       // rolling PnL history for auto-halt drawdown checks
   let scoreWeightMap: Map<string, number> = new Map(); // score-weighted capital share per asset
@@ -710,42 +718,81 @@ async function main() {
         const dd1h  = cp1h  ? (currentPnl - cp1h.pnl)  / Math.max(vaultEquity, 1) : 0;
         const dd24h = cp24h ? (currentPnl - cp24h.pnl) / Math.max(vaultEquity, 1) : 0;
 
-        // Use BTC ATR as a market-wide volatility proxy
+        // Fix #1 — ATR slope: track rolling 4-sample ring to detect rising volatility
         const btcAtr = marketEngine.getSnapshot("BTC")?.atrPct ?? 0;
+        autoHaltAtrRing.push(btcAtr);
+        if (autoHaltAtrRing.length > 4) autoHaltAtrRing.shift();
+        // positive slope = volatility still rising; block resume even if below threshold
+        const atrSlope = autoHaltAtrRing.length >= 4
+          ? autoHaltAtrRing[autoHaltAtrRing.length - 1] - autoHaltAtrRing[0]
+          : 0;
 
         const latencyBreach  = hlLatencyMs > AUTO_HALT_HL_LATENCY_MS;
         const drawdownBreach = dd1h < -AUTO_HALT_1H_PCT || dd24h < -AUTO_HALT_24H_PCT;
+        // Fix #2 — severity: detect severe latency spikes (>2× threshold)
+        const latencySevere  = hlLatencyMs > AUTO_HALT_HL_LATENCY_MS * AUTO_HALT_LATENCY_SEVERE_MULT;
 
         if ((latencyBreach || drawdownBreach) && !autoHalt) {
           // ── Trigger ─────────────────────────────────────────────────────────
           autoHalt = true;
           autoHaltClearCount = 0;
+          if (latencySevere) {
+            autoHaltExtraCooldown += AUTO_HALT_LATENCY_SEVERE_EXTRA;
+            logger.risk(`[AUTO-HALT] Severe latency ${hlLatencyMs}ms (>${AUTO_HALT_HL_LATENCY_MS * AUTO_HALT_LATENCY_SEVERE_MULT}ms) — extended cooldown +${AUTO_HALT_LATENCY_SEVERE_EXTRA} cycles`);
+          }
           if (dd1h < -AUTO_HALT_1H_PCT)   logger.risk(`[AUTO-HALT] 1h drawdown ${(dd1h * 100).toFixed(2)}% < -${(AUTO_HALT_1H_PCT * 100).toFixed(0)}% — halting new entries`);
           if (dd24h < -AUTO_HALT_24H_PCT) logger.risk(`[AUTO-HALT] 24h drawdown ${(dd24h * 100).toFixed(2)}% < -${(AUTO_HALT_24H_PCT * 100).toFixed(0)}% — halting new entries`);
-          if (latencyBreach)              logger.risk(`[AUTO-HALT] HL latency ${hlLatencyMs}ms > ${AUTO_HALT_HL_LATENCY_MS}ms — halting new entries`);
+          if (latencyBreach && !latencySevere) logger.risk(`[AUTO-HALT] HL latency ${hlLatencyMs}ms > ${AUTO_HALT_HL_LATENCY_MS}ms — halting new entries`);
         } else if (autoHalt) {
-          // ── Recovery guard: require sustained stability before auto-resume ──
-          // All three recovery conditions must hold every cycle; any failure resets the counter.
-          const atrNormalized   = btcAtr < (parseFloat(process.env.ATR_TARGET_VOL_PCT ?? "0.02") * AUTO_HALT_ATR_RATIO);
-          const allClear = !latencyBreach && !drawdownBreach && atrNormalized;
-
-          if (allClear) {
-            autoHaltClearCount++;
-            logger.info(`[AUTO-HALT] Recovery check ${autoHaltClearCount}/${AUTO_HALT_CLEAR_CYCLES}: latency ✓  drawdown ✓  ATR ✓`);
-            if (autoHaltClearCount >= AUTO_HALT_CLEAR_CYCLES) {
-              autoHalt = false;
-              autoHaltClearCount = 0;
-              logger.info("[AUTO-HALT] Sustained recovery confirmed — auto-halt lifted");
-            }
+          // Fix #2 — drain severe cooldown first (no recovery checks while locked)
+          if (autoHaltExtraCooldown > 0) {
+            autoHaltExtraCooldown--;
+            logger.info(`[AUTO-HALT] Severe cooldown — ${autoHaltExtraCooldown} extra cycles remaining`);
           } else {
-            // One bad sample resets the counter — no partial credit
-            if (autoHaltClearCount > 0) {
+            // ── Recovery guard (all gates must pass every cycle) ─────────────
+            const ATR_TARGET      = parseFloat(process.env.ATR_TARGET_VOL_PCT ?? "0.02");
+            const atrNormalized   = btcAtr < ATR_TARGET * AUTO_HALT_ATR_RATIO;
+            const atrNotRising    = atrSlope <= 0; // Fix #1: volatility must not be trending up
+
+            // Fix #3 — position sanity: ensure portfolio is structurally safe to re-enter
+            const spotExp = Array.from(positions.entries())
+              .filter(([k]) => k.endsWith("_SPOT")).reduce((s, [, p]) => s + (p.quoteAmount ?? 0), 0);
+            const perpExp = Array.from(positions.entries())
+              .filter(([k]) => k.endsWith("_PERP")).reduce((s, [, p]) => s + (p.quoteAmount ?? 0), 0);
+            const maxExp        = Math.max(spotExp, perpExp, 1);
+            const netDeltaPct   = Math.abs(spotExp - perpExp) / maxExp;
+            const totalExposure = (spotExp + perpExp) / Math.max(vaultEquity, 1);
+            const positionsSane = netDeltaPct <= AUTO_HALT_DELTA_GATE_PCT
+                                && totalExposure <= AUTO_HALT_EXPOSURE_GATE_PCT;
+
+            const allClear = !latencyBreach && !drawdownBreach
+                          && atrNormalized && atrNotRising && positionsSane;
+
+            if (allClear) {
+              autoHaltClearCount++;
               logger.info(
-                `[AUTO-HALT] Recovery stalled — reset counter (latency:${latencyBreach} dd:${drawdownBreach} atr:${!atrNormalized}) ` +
-                `— back to 0/${AUTO_HALT_CLEAR_CYCLES}`
+                `[AUTO-HALT] Recovery ${autoHaltClearCount}/${AUTO_HALT_CLEAR_CYCLES}: ` +
+                `latency ✓  drawdown ✓  ATR ✓ (slope${atrSlope > 0 ? "+" : ""}${atrSlope.toFixed(4)})  delta ${(netDeltaPct * 100).toFixed(1)}% ✓  exposure ${(totalExposure * 100).toFixed(1)}% ✓`
               );
+              if (autoHaltClearCount >= AUTO_HALT_CLEAR_CYCLES) {
+                autoHalt = false;
+                autoHaltClearCount = 0;
+                logger.info("[AUTO-HALT] Sustained recovery confirmed — auto-halt lifted");
+              }
+            } else {
+              // Any failed gate resets counter — no partial credit
+              if (autoHaltClearCount > 0) {
+                const failed = [
+                  latencyBreach  && "latency",
+                  drawdownBreach && "drawdown",
+                  !atrNormalized && "ATR-level",
+                  !atrNotRising  && "ATR-rising",
+                  !positionsSane && `delta ${(netDeltaPct * 100).toFixed(1)}%/exp ${(totalExposure * 100).toFixed(1)}%`,
+                ].filter(Boolean).join(", ");
+                logger.info(`[AUTO-HALT] Recovery stalled (${failed}) — reset to 0/${AUTO_HALT_CLEAR_CYCLES}`);
+              }
+              autoHaltClearCount = 0;
             }
-            autoHaltClearCount = 0;
           }
         }
       }
