@@ -50,6 +50,13 @@ const ETM_PEAK_EARLY_BIAS       = parseFloat(process.env.ETM_PEAK_EARLY_BIAS    
 const ETM_SPIKE_OVERRIDE_THRESH = parseFloat(process.env.ETM_SPIKE_OVERRIDE_THRESH ?? "0.9");  // raw score above this bypasses EMA
 const ETM_COOLDOWN_LONG_THRESH  = parseFloat(process.env.ETM_COOLDOWN_LONG_THRESH  ?? "0.65"); // raw score above this → long cooldown
 
+// Spike exit flat period: block re-entry for N cycles after a spike FULL_EXIT
+const FRC_SPIKE_EXIT_FLAT_CYCLES = parseInt(process.env.FRC_SPIKE_EXIT_FLAT_CYCLES ?? "2");
+
+// ATR-scaled cooldown: scales all cooldown durations by market volatility
+const ETM_ATR_BASELINE = parseFloat(process.env.ETM_ATR_BASELINE ?? "0.01"); // 1% ATR = 1× multiplier
+const ETM_ATR_VOL_CAP  = parseFloat(process.env.ETM_ATR_VOL_CAP  ?? "2.0");  // max multiplier cap
+
 // ── Types ───────────────────────────────────────────────────────────────────
 export type FundingRegime =
   | "ACCUMULATION"
@@ -91,8 +98,9 @@ export class FundingRegimeClassifier {
   private readonly persistRings  = new Map<string, number[]>(); // persistence history → drop detection
 
   // ETM state (mutated by getExitSignal)
-  private readonly exitScoreEMA  = new Map<string, number>();   // smoothed exit score per asset
-  private readonly reduceCooldown = new Map<string, number>();  // cycles remaining after REDUCE_50
+  private readonly exitScoreEMA    = new Map<string, number>();   // smoothed exit score per asset
+  private readonly reduceCooldown  = new Map<string, number>();   // cycles remaining after REDUCE_50
+  private readonly spikeExitCooldown = new Map<string, number>(); // cycles before re-entry after spike FULL_EXIT
 
   // Classifier state
   private readonly lastResults   = new Map<string, RegimeResult>();
@@ -106,9 +114,11 @@ export class FundingRegimeClassifier {
     const fNow     = snap.fundingRate;
     const oi_slope = snap.oiChangeRatePct ?? 0;
 
-    // ── Decrement reduce cooldown (counts down every cycle) ───────────────
+    // ── Decrement cooldowns (count down every cycle) ──────────────────────
     const cd = this.reduceCooldown.get(asset) ?? 0;
     if (cd > 0) this.reduceCooldown.set(asset, cd - 1);
+    const sc = this.spikeExitCooldown.get(asset) ?? 0;
+    if (sc > 0) this.spikeExitCooldown.set(asset, sc - 1);
 
     // ── Funding ring ──────────────────────────────────────────────────────
     const fRing = this.fundingRings.get(asset) ?? [];
@@ -205,13 +215,22 @@ export class FundingRegimeClassifier {
       effectiveScore >= ETM_EXIT_PARTIAL          ? "REDUCE_50" :
       "HOLD";
 
+    // ── ATR volatility multiplier: scale all cooldowns with market speed ─────
+    const atrPct    = snap.atrPct ?? ETM_ATR_BASELINE;
+    const volMult   = Math.min(ETM_ATR_VOL_CAP, Math.max(1.0, atrPct / ETM_ATR_BASELINE));
+
     // ── Context-aware cooldown: reflect actual decision pressure (inc. PEAK_EARLY bias) ─
     if (action === "REDUCE_50") {
       const cooldownScore = Math.max(exitScore, effectiveScore);
-      const cooldown = cooldownScore >= ETM_COOLDOWN_LONG_THRESH
+      const baseCycles    = cooldownScore >= ETM_COOLDOWN_LONG_THRESH
         ? FRC_REDUCE_COOLDOWN_LONG   // 5 cycles when effective pressure is elevated
         : FRC_REDUCE_COOLDOWN_CYCLES; // 3 cycles for moderate reduction
-      this.reduceCooldown.set(asset, cooldown);
+      this.reduceCooldown.set(asset, Math.round(baseCycles * volMult));
+    }
+
+    // ── Spike flat period: block re-entry for N cycles after panic exit ───────
+    if (spikeOverride) {
+      this.spikeExitCooldown.set(asset, Math.max(1, Math.round(FRC_SPIKE_EXIT_FLAT_CYCLES * volMult)));
     }
 
     // ── Reason string ─────────────────────────────────────────────────────
@@ -238,6 +257,11 @@ export class FundingRegimeClassifier {
   /** Returns remaining reduce-cooldown cycles for this asset (0 = no cooldown). */
   getReduceCooldown(asset: string): number {
     return this.reduceCooldown.get(asset) ?? 0;
+  }
+
+  /** Returns remaining spike-exit flat-period cycles for this asset (0 = re-entry allowed). */
+  getSpikeExitCooldown(asset: string): number {
+    return this.spikeExitCooldown.get(asset) ?? 0;
   }
 
   /** Returns the last cached regime result without updating state. */

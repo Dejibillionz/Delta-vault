@@ -1155,7 +1155,8 @@ async function main() {
             logger.info(
               `[FRC_EXIT] ${asset}: regime=${regimeResult.regime} ` +
               `raw=${frcExit.exitScore.toFixed(3)} effective=${frcExit.effectiveScore.toFixed(3)} ` +
-              `cooldown=${frc.getReduceCooldown(asset)} spike=${frcExit.spikeOverride} → ${label}`
+              `reduce_cd=${frc.getReduceCooldown(asset)} spike_cd=${frc.getSpikeExitCooldown(asset)} ` +
+              `spike=${frcExit.spikeOverride} → ${label}`
             );
             signal = {
               asset,
@@ -1310,6 +1311,11 @@ async function main() {
           // Post-REDUCE_50 cooldown: block re-entry for N cycles to avoid churn
           executionData.events.push(
             `${asset}: post-REDUCE_50 cooldown (${frc.getReduceCooldown(asset)} cycles) — re-entry blocked`
+          );
+        } else if (isOpenSignal && frc.getSpikeExitCooldown(asset) > 0) {
+          // Post-spike flat period: enforce minimum pause before re-entry after panic exit
+          executionData.events.push(
+            `${asset}: post-spike flat period (${frc.getSpikeExitCooldown(asset)} cycles) — re-entry blocked`
           );
         } else if (isOpenSignal && fppResult.persistenceScore < FPP_MIN_PERSISTENCE) {
           // FPP gate: funding edge not expected to persist long enough
