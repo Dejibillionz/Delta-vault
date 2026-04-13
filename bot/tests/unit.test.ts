@@ -12,6 +12,7 @@ import { EnhancedRiskEngine, MarketConditions } from "../src/enhancedRiskEngine"
 import { getPositionSize } from "../src/agent/sizing";
 import { createInitialState } from "../src/agent/state";
 import { Logger } from "../src/logger";
+import { FundingPersistencePredictor } from "../src/services/fundingPersistence";
 
 // ── Test harness ──────────────────────────────────────────────────────────────
 let passed = 0;
@@ -52,6 +53,7 @@ const BASE_SNAP = {
   liquidityScore: 0.9,
   pythConfidence: 0.001,
   oiChangeRatePct: 0,
+  atrPct: 0,
 };
 
 test("PARK_CAPITAL when funding near zero", () => {
@@ -238,6 +240,140 @@ test("halves size on high volatility (> 1)", () => {
   const normal = getPositionSize({ ...state, confidence: 1.0 }, 0.5);
   const vol    = getPositionSize({ ...state, confidence: 1.0 }, 1.5);
   assert.ok(vol < normal, `High-vol size (${vol}) should be < normal (${normal})`);
+});
+
+// ── FundingPersistencePredictor tests ────────────────────────────────────────
+console.log("\n── FundingPersistencePredictor ─────────────────────────────");
+
+/** Minimal snap builder — only fields the FPP reads */
+function fppSnap(overrides: {
+  fundingRate?: number;
+  oiChangeRatePct?: number;
+  longShortRatio?: number;
+  atrPct?: number;
+}) {
+  return {
+    ...BASE_SNAP,
+    fundingRate:     overrides.fundingRate     ?? 0.0001,
+    oiChangeRatePct: overrides.oiChangeRatePct ?? 0,
+    longShortRatio:  overrides.longShortRatio  ?? 0.5,
+    atrPct:          overrides.atrPct          ?? 0.01,
+  };
+}
+
+/** Warm the FPP ring with N identical samples, return last result. */
+function warmFpp(fpp: FundingPersistencePredictor, asset: string, snap: any, n: number) {
+  let r = fpp.update(asset, snap);
+  for (let i = 1; i < n; i++) r = fpp.update(asset, snap);
+  return r;
+}
+
+test("persistenceScore is in [0, 1] after single update", () => {
+  const fpp = new FundingPersistencePredictor();
+  const r = fpp.update("BTC", fppSnap({ fundingRate: 0.0001 }));
+  assert.ok(r.persistenceScore >= 0 && r.persistenceScore <= 1,
+    `persistenceScore out of range: ${r.persistenceScore}`);
+});
+
+test("stable positive funding produces high stabilityScore (> 0.5)", () => {
+  const fpp = new FundingPersistencePredictor();
+  const snap = fppSnap({ fundingRate: 0.0002, oiChangeRatePct: 0.04 });
+  const r = warmFpp(fpp, "BTC", snap, 20);
+  assert.ok(r.components.stabilityScore > 0.5,
+    `Expected stabilityScore > 0.5, got ${r.components.stabilityScore}`);
+});
+
+test("OI rising + positive funding → oiScore > 0", () => {
+  const fpp = new FundingPersistencePredictor();
+  const r = fpp.update("ETH", fppSnap({ fundingRate: 0.0001, oiChangeRatePct: 0.05 }));
+  assert.ok(r.components.oiScore > 0,
+    `Expected oiScore > 0 when OI rising + funding positive, got ${r.components.oiScore}`);
+});
+
+test("OI falling while funding positive → oiDivergence filter fires", () => {
+  const fpp = new FundingPersistencePredictor();
+  // oiSlope < -0.03 triggers OI divergence kill (×0.3)
+  const r = fpp.update("SOL", fppSnap({ fundingRate: 0.0002, oiChangeRatePct: -0.06 }));
+  assert.ok(r.filters.oiDivergence,
+    "Expected oiDivergence=true when OI dropping 6% with positive funding");
+  // Score should be reduced — oiDivergence multiplies by 0.3
+  const rNormal = fpp.update("SOL", fppSnap({ fundingRate: 0.0002, oiChangeRatePct: 0.0 }));
+  assert.ok(r.persistenceScore < rNormal.persistenceScore,
+    `OI divergence score (${r.persistenceScore}) should be < normal (${rNormal.persistenceScore})`);
+});
+
+test("ATR above conflict level → atrConflict fires, score halved", () => {
+  const fpp = new FundingPersistencePredictor();
+  const snap = fppSnap({ fundingRate: 0.0002, oiChangeRatePct: 0.03 });
+  const rNormal = fpp.update("BTC", { ...snap, atrPct: 0.01 }); // below ATR_TARGET(0.02)×2
+  const rConflict = fpp.update("BTC", { ...snap, atrPct: 0.05 }); // above 0.02×2=0.04 → conflict
+  assert.ok(rConflict.filters.atrConflict,
+    "Expected atrConflict=true when ATR is 5% (above 0.02*2 = 4% threshold)");
+  assert.ok(rConflict.persistenceScore < rNormal.persistenceScore,
+    `Conflict score (${rConflict.persistenceScore}) should be < normal (${rNormal.persistenceScore})`);
+});
+
+test("bullish crowd + positive funding → alignmentScore = 1", () => {
+  const fpp = new FundingPersistencePredictor();
+  const r = fpp.update("BTC", fppSnap({ fundingRate: 0.0002, longShortRatio: 0.65 }));
+  assert.strictEqual(r.components.alignmentScore, 1,
+    `Expected alignmentScore=1 for bullish crowd + positive funding, got ${r.components.alignmentScore}`);
+});
+
+test("bearish crowd + negative funding → alignmentScore = 1", () => {
+  const fpp = new FundingPersistencePredictor();
+  const r = fpp.update("BTC", fppSnap({ fundingRate: -0.0002, longShortRatio: 0.40 }));
+  assert.strictEqual(r.components.alignmentScore, 1,
+    `Expected alignmentScore=1 for bearish crowd + negative funding, got ${r.components.alignmentScore}`);
+});
+
+test("rising funding slope → trendScore > 0.5", () => {
+  const fpp = new FundingPersistencePredictor();
+  // Warm up at low rate, then escalate to create positive slope
+  for (let i = 0; i < 5; i++) fpp.update("BTC", fppSnap({ fundingRate: 0.00005 }));
+  const r = fpp.update("BTC", fppSnap({ fundingRate: 0.0003 })); // big jump → positive directed slope
+  assert.ok(r.components.trendScore > 0.5,
+    `Expected trendScore > 0.5 when funding rising sharply, got ${r.components.trendScore}`);
+});
+
+test("falling funding slope → trendScore < 0.5", () => {
+  const fpp = new FundingPersistencePredictor();
+  // Warm at high rate, then drop
+  for (let i = 0; i < 5; i++) fpp.update("BTC", fppSnap({ fundingRate: 0.0003 }));
+  const r = fpp.update("BTC", fppSnap({ fundingRate: 0.00005 })); // big drop → negative directed slope
+  assert.ok(r.components.trendScore < 0.5,
+    `Expected trendScore < 0.5 when funding falling, got ${r.components.trendScore}`);
+});
+
+test("effectiveEdge = persistenceScore × max(0, expectedEdge)", () => {
+  const fpp = new FundingPersistencePredictor();
+  const r = warmFpp(fpp, "BTC", fppSnap({ fundingRate: 0.0002, oiChangeRatePct: 0.03 }), 10);
+  // effectiveEdge should equal max(0, expectedEdge) * persistenceScore (within float tolerance)
+  const expected = Math.max(0, r.expectedEdge) * r.persistenceScore;
+  assert.ok(Math.abs(r.effectiveEdge - expected) < 1e-12,
+    `effectiveEdge (${r.effectiveEdge}) ≠ max(0,edge)×score (${expected})`);
+});
+
+test("bestEffectiveEdge returns 0 when no updates exist", () => {
+  const fpp = new FundingPersistencePredictor();
+  assert.strictEqual(fpp.bestEffectiveEdge(["BTC", "ETH"]), 0,
+    "Expected 0 for fresh predictor with no history");
+});
+
+test("bestEffectiveEdge picks max across assets", () => {
+  const fpp = new FundingPersistencePredictor();
+  fpp.update("BTC", fppSnap({ fundingRate: 0.00005, oiChangeRatePct: 0 }));
+  fpp.update("ETH", fppSnap({ fundingRate: 0.0005,  oiChangeRatePct: 0.03, longShortRatio: 0.65 }));
+  const best = fpp.bestEffectiveEdge(["BTC", "ETH"]);
+  const btcEdge = fpp.getLatestResult("BTC")!.effectiveEdge;
+  const ethEdge = fpp.getLatestResult("ETH")!.effectiveEdge;
+  assert.strictEqual(best, Math.max(btcEdge, ethEdge),
+    `Expected max(${btcEdge}, ${ethEdge}) = ${Math.max(btcEdge, ethEdge)}, got ${best}`);
+});
+
+test("getLatestResult returns null before first update", () => {
+  const fpp = new FundingPersistencePredictor();
+  assert.strictEqual(fpp.getLatestResult("BTC"), null);
 });
 
 // ── Results ───────────────────────────────────────────────────────────────────

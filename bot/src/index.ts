@@ -45,6 +45,7 @@ import { FundingRateScanner }                        from "./services/fundingRat
 import { CexFundingRates }                           from "./services/cexFundingRates";
 import { FundingSettlementTimer }                    from "./services/fundingSettlementTimer";
 import { BybitExecutor }                             from "./services/bybitExecution";
+import { FundingPersistencePredictor }               from "./services/fundingPersistence";
 
 // Cross-chain imports
 import { getCrossChainFunding }                       from "./services/crossChainFunding";
@@ -125,6 +126,9 @@ const POST_HALT_PHASE1_CAP = parseFloat(process.env.POST_HALT_PHASE1_CAP ?? "0.3
 const POST_HALT_PHASE2_CAP = parseFloat(process.env.POST_HALT_PHASE2_CAP ?? "0.50"); // 50% cap for 5-15 min
 const POST_HALT_PHASE1_MS  = parseInt(process.env.POST_HALT_PHASE1_MS   ?? String(5  * 60_000)); //  5 min
 const POST_HALT_PHASE2_MS  = parseInt(process.env.POST_HALT_PHASE2_MS   ?? String(15 * 60_000)); // 15 min
+// Funding Persistence Predictor thresholds
+const FPP_MIN_PERSISTENCE  = parseFloat(process.env.FPP_MIN_PERSISTENCE  ?? "0.45"); // block entry below this
+const FPP_SIZING_FLOOR     = parseFloat(process.env.FPP_SIZING_FLOOR     ?? "0.50"); // sizing floor: 50% + 50%×score
 
 const logger = new Logger("./logs");
 
@@ -218,6 +222,7 @@ async function main() {
   const cexRates        = new CexFundingRates(logger);
   const settlementTimer = new FundingSettlementTimer(marketEngine);
   const scanner = new FundingRateScanner(marketEngine, logger, undefined, cexRates);
+  const fpp     = new FundingPersistencePredictor();
   let activeAssets: string[] = [...TRADING_ASSETS];
   const drainingAssets       = new Set<string>();
   const drainEntryTimes      = new Map<string, number>();
@@ -772,15 +777,16 @@ async function main() {
           const netDeltaPct   = Math.abs(spotExp - perpExp) / maxExp;
           const totalExposure = (spotExp + perpExp) / Math.max(vaultEquity, 1);
 
-          // Gate 6 — funding edge in hourly units (fixes APR/horizon mismatch):
-          //   fundingRate is already per-hour; compare against hourly fee equivalent.
-          //   Env vars stay as APR for human legibility; converted to hourly here.
-          const feeHourly     = AUTO_HALT_FEE_EST_APR / 8760;
+          // Gate 6 — FPP effectiveEdge: persistence-weighted, projected, fee-adjusted (unit-coherent hourly)
           const minEdgeHourly = AUTO_HALT_MIN_EDGE_APR / 8760;
-          const bestEdge = activeAssets.reduce((best, a) => {
+          const feeHourly     = AUTO_HALT_FEE_EST_APR  / 8760;
+          const fppBest = fpp.bestEffectiveEdge(activeAssets);
+          // Fallback to raw edge (×0.6 conservative discount) if FPP ring is still accumulating
+          const rawFallback = activeAssets.reduce((best, a) => {
             const s = marketEngine.getSnapshot(a);
             return s ? Math.max(best, Math.abs(s.fundingRate) - feeHourly) : best;
-          }, 0);
+          }, 0) * 0.6;
+          const bestEdge = fppBest > 0 ? fppBest : rawFallback;
           const edgeSufficient = bestEdge >= minEdgeHourly;
 
           // Gate 7 — portfolio correlation level + slope (prevents re-entry into tightening regimes)
@@ -838,7 +844,7 @@ async function main() {
                 `latency ✓  drawdown ✓  ` +
                 `ATR ✓(slope${atrSlope > 0 ? "+" : ""}${atrSlope.toFixed(4)})  ` +
                 `delta ${(netDeltaPct * 100).toFixed(1)}% ✓  exp ${(totalExposure * 100).toFixed(1)}% ✓  ` +
-                `edge ${(bestEdge * 1_000_000 / 100).toFixed(4)}%/hr ✓  ` +
+                `edge ${(bestEdge * 1_000_000 / 100).toFixed(4)}%/hr${fppBest > 0 ? "(FPP)" : "(raw×0.6)"} ✓  ` +
                 `corr ${avgCorr.toFixed(3)}(slope${corrSlope > 0 ? "+" : ""}${corrSlope.toFixed(3)}) ✓`
               );
               if (autoHaltClearCount >= requiredCycles) {
@@ -859,7 +865,7 @@ async function main() {
                   !atrNotRising                                    && "ATR-rising",
                   netDeltaPct  > AUTO_HALT_DELTA_GATE_PCT          && `delta ${(netDeltaPct * 100).toFixed(1)}%`,
                   totalExposure > effectiveExposureCap             && `exposure ${(totalExposure * 100).toFixed(1)}%(cap ${(effectiveExposureCap * 100).toFixed(0)}%${avgCorr > AUTO_HALT_CORR_THRESHOLD ? " corr-tightened" : ""})`,
-                  !edgeSufficient                                  && `edge ${(bestEdge * 1_000_000 / 100).toFixed(4)}%/hr < ${(minEdgeHourly * 1_000_000 / 100).toFixed(4)}%/hr`,
+                  !edgeSufficient                                  && `edge ${(bestEdge * 1_000_000 / 100).toFixed(4)}%/hr${fppBest > 0 ? "(FPP)" : "(raw×0.6)"} < ${(minEdgeHourly * 1_000_000 / 100).toFixed(4)}%/hr`,
                   !corrNotRising                                   && `corr rising +${corrSlope.toFixed(3)}`,
                 ].filter(Boolean).join(", ");
                 logger.info(`[AUTO-HALT] Recovery stalled (${failed}) — reset to 0/${requiredCycles}`);
@@ -1073,6 +1079,9 @@ async function main() {
         const snap = marketEngine.getSnapshot(asset);
         if (!snap) { logger.warn(`${asset}: no snapshot`); continue; }
 
+        // Update Funding Persistence Predictor — must run every cycle before any gates
+        const fppResult = fpp.update(asset, snap);
+
         // Store market data for logging
         marketData[asset] = {
           price: snap.spotPrice,
@@ -1185,7 +1194,10 @@ async function main() {
 
         const capitalPerAsset = totalCapital * (scoreWeightMap.get(asset) ?? 1 / activeAssets.length) * postHaltFactor;
         // Ensure delta allocation is at least MIN_TRADE_SIZE when signal wants to open
-        const rawDeltaCapital = capitalPerAsset * finalAllocation.delta;
+        // Scale by persistence: floor at FPP_SIZING_FLOOR so fully-persistent trades get full size,
+        // weak-but-passing trades get proportionally less (never drops below floor × capital)
+        const persistenceSizingMult = FPP_SIZING_FLOOR + (1 - FPP_SIZING_FLOOR) * fppResult.persistenceScore;
+        const rawDeltaCapital = capitalPerAsset * finalAllocation.delta * persistenceSizingMult;
         const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(MIN_TRADE_SIZE, rawDeltaCapital));
         plannedLendingByAsset[asset] = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset - deltaCapitalAsset));
 
@@ -1216,6 +1228,17 @@ async function main() {
         } else if (isOpenSignal && SCANNER_ENABLED && scanner.getTrend(asset).direction === 'falling') {
           // Trend gate: block entry when funding EWMA trend is falling
           executionData.events.push(`${asset}: funding trend falling (↓) — holding entry, waiting for reversal`);
+        } else if (isOpenSignal && fppResult.persistenceScore < FPP_MIN_PERSISTENCE) {
+          // FPP gate: funding edge not expected to persist long enough
+          const { persistenceScore, expectedEdge, filters } = fppResult;
+          const filterTag = filters.fakeSpike ? " [FAKE-SPIKE]"
+                          : filters.oiDivergence ? " [OI-DIV]"
+                          : filters.atrConflict ? " [ATR-CONFLICT]"
+                          : "";
+          executionData.events.push(
+            `${asset}: FPP persistence ${persistenceScore.toFixed(3)} < ${FPP_MIN_PERSISTENCE}` +
+            `${filterTag} | edge ${(expectedEdge * 1e6 / 100).toFixed(4)}%/hr — skip entry`
+          );
         } else if (isOpenSignal) {
           const blockedByAgent = agentDecision?.action === "SKIP" && agentDecision.asset === asset;
 
