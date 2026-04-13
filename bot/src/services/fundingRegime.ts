@@ -185,9 +185,11 @@ export class FundingRegimeClassifier {
     // ── Spike override: raw > 0.9 bypasses EMA lag on sharp reversals ────
     const spikeOverride = exitScore > ETM_SPIKE_OVERRIDE_THRESH;
 
-    // ── EMA smoothing: always updated so history reflects true signal ─────
+    // ── EMA smoothing: spike resets EMA to raw to clear lingering bias ───────
     const prevEMA = this.exitScoreEMA.get(asset) ?? exitScore;
-    const exitScoreSmoothed = ETM_EMA_ALPHA * exitScore + (1 - ETM_EMA_ALPHA) * prevEMA;
+    const exitScoreSmoothed = spikeOverride
+      ? exitScore  // reset: don't let old high EMA contaminate post-exit cycles
+      : ETM_EMA_ALPHA * exitScore + (1 - ETM_EMA_ALPHA) * prevEMA;
     this.exitScoreEMA.set(asset, exitScoreSmoothed);
 
     // ── PEAK_EARLY soft bias: +0.1 nudge toward de-risking ───────────────
@@ -203,10 +205,11 @@ export class FundingRegimeClassifier {
       effectiveScore >= ETM_EXIT_PARTIAL          ? "REDUCE_50" :
       "HOLD";
 
-    // ── Context-aware cooldown: stronger raw signal → longer stabilization ─
+    // ── Context-aware cooldown: reflect actual decision pressure (inc. PEAK_EARLY bias) ─
     if (action === "REDUCE_50") {
-      const cooldown = exitScore >= ETM_COOLDOWN_LONG_THRESH
-        ? FRC_REDUCE_COOLDOWN_LONG   // 5 cycles when raw score is elevated
+      const cooldownScore = Math.max(exitScore, effectiveScore);
+      const cooldown = cooldownScore >= ETM_COOLDOWN_LONG_THRESH
+        ? FRC_REDUCE_COOLDOWN_LONG   // 5 cycles when effective pressure is elevated
         : FRC_REDUCE_COOLDOWN_CYCLES; // 3 cycles for moderate reduction
       this.reduceCooldown.set(asset, cooldown);
     }

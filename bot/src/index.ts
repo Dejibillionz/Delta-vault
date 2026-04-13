@@ -131,8 +131,9 @@ const POST_HALT_PHASE2_MS  = parseInt(process.env.POST_HALT_PHASE2_MS   ?? Strin
 const FPP_MIN_PERSISTENCE  = parseFloat(process.env.FPP_MIN_PERSISTENCE  ?? "0.45"); // block entry below this
 const FPP_SIZING_FLOOR     = parseFloat(process.env.FPP_SIZING_FLOOR     ?? "0.50"); // sizing floor: 50% + 50%×score
 // Funding Regime Classifier + Exit Timing Model
-const FRC_PERSIST_FULL_SIZE_OVERRIDE = parseFloat(process.env.FRC_PERSIST_FULL_SIZE_OVERRIDE ?? "0.59"); // ACCUMULATION full-size when persistence is in upper dead-band (0.59–0.65)
-const FRC_PERSIST_OVERRIDE_EXIT      = parseFloat(process.env.FRC_EXPANSION_EXIT             ?? "0.55"); // hysteresis: deactivate override when persistence drops below this
+const FRC_PERSIST_FULL_SIZE_OVERRIDE   = parseFloat(process.env.FRC_PERSIST_FULL_SIZE_OVERRIDE   ?? "0.59"); // ACCUMULATION full-size when persistence is in upper dead-band (0.59–0.65)
+const FRC_PERSIST_OVERRIDE_EXIT        = parseFloat(process.env.FRC_EXPANSION_EXIT               ?? "0.55"); // hysteresis: deactivate override when persistence drops below this
+const FRC_PERSIST_OVERRIDE_REENTRY_BLOCK = parseInt(process.env.FRC_PERSIST_OVERRIDE_REENTRY_BLOCK ?? "2"); // cycles to block re-activation after regime-departure reset
 const ETM_EXIT_FULL    = parseFloat(process.env.ETM_EXIT_FULL    ?? "0.7");
 const ETM_EXIT_PARTIAL = parseFloat(process.env.ETM_EXIT_PARTIAL ?? "0.5");
 
@@ -230,8 +231,9 @@ async function main() {
   const scanner = new FundingRateScanner(marketEngine, logger, undefined, cexRates);
   const fpp     = new FundingPersistencePredictor();
   const frc     = new FundingRegimeClassifier();
-  const prevRegimeMap           = new Map<string, string>(); // for regime transition logging
+  const prevRegimeMap             = new Map<string, string>();   // for regime transition logging
   const persistenceOverrideActive = new Map<string, boolean>(); // hysteresis for ACCUMULATION override
+  const persistenceOverrideReentryBlock = new Map<string, number>(); // cycles blocking re-activation after regime flip
   let activeAssets: string[] = [...TRADING_ASSETS];
   const drainingAssets       = new Set<string>();
   const drainEntryTimes      = new Map<string, number>();
@@ -1150,7 +1152,11 @@ async function main() {
           const frcExit = frc.getExitSignal(asset, snap, fppResult);
           if (frcExit.action !== "HOLD") {
             const label = frcExit.action === "REDUCE_50" ? "REDUCE_50" : "FULL_EXIT";
-            logger.info(`[FRC] ${asset}: ${label} (effective=${frcExit.effectiveScore.toFixed(2)} raw=${frcExit.exitScore.toFixed(2)}) — ${frcExit.reason}`);
+            logger.info(
+              `[FRC_EXIT] ${asset}: regime=${regimeResult.regime} ` +
+              `raw=${frcExit.exitScore.toFixed(3)} effective=${frcExit.effectiveScore.toFixed(3)} ` +
+              `cooldown=${frc.getReduceCooldown(asset)} spike=${frcExit.spikeOverride} → ${label}`
+            );
             signal = {
               asset,
               signal: currentState === "DELTA_NEUTRAL" ? "DELTA_NEUTRAL_CLOSE" : "BASIS_TRADE_CLOSE",
@@ -1241,14 +1247,22 @@ async function main() {
         const persistenceSizingMult = FPP_SIZING_FLOOR + (1 - FPP_SIZING_FLOOR) * fppResult.persistenceScore;
         // Regime sizing: ACCUMULATION = half size (early, unconfirmed); EXPANSION = full size
         // Override with hysteresis: activate at persistence > 0.59, deactivate below 0.55 (mirrors FRC_EXPANSION_EXIT)
+        // Reentry delay: after regime-departure reset, block reactivation for N cycles to prevent micro-flip exploitation
+        const reentryBlock = persistenceOverrideReentryBlock.get(asset) ?? 0;
+        if (reentryBlock > 0) persistenceOverrideReentryBlock.set(asset, reentryBlock - 1);
         if (regimeResult.regime === "ACCUMULATION") {
           if (fppResult.persistenceScore > FRC_PERSIST_FULL_SIZE_OVERRIDE && !persistenceOverrideActive.get(asset)) {
-            persistenceOverrideActive.set(asset, true);
+            if (reentryBlock === 0) persistenceOverrideActive.set(asset, true);
           } else if (fppResult.persistenceScore < FRC_PERSIST_OVERRIDE_EXIT && persistenceOverrideActive.get(asset)) {
             persistenceOverrideActive.set(asset, false);
+            // Organic persistence fade: no reentry block (hysteresis handles this naturally)
           }
         } else {
-          persistenceOverrideActive.set(asset, false); // reset when outside ACCUMULATION
+          if (persistenceOverrideActive.get(asset)) {
+            persistenceOverrideActive.set(asset, false);
+            // Regime departure: block re-activation to prevent micro-flip exploitation
+            persistenceOverrideReentryBlock.set(asset, FRC_PERSIST_OVERRIDE_REENTRY_BLOCK);
+          }
         }
         const regimeSizingMult  =
           regimeResult.regime === "ACCUMULATION" && persistenceOverrideActive.get(asset)
