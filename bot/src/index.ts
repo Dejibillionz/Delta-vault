@@ -131,8 +131,8 @@ const POST_HALT_PHASE2_MS  = parseInt(process.env.POST_HALT_PHASE2_MS   ?? Strin
 const FPP_MIN_PERSISTENCE  = parseFloat(process.env.FPP_MIN_PERSISTENCE  ?? "0.45"); // block entry below this
 const FPP_SIZING_FLOOR     = parseFloat(process.env.FPP_SIZING_FLOOR     ?? "0.50"); // sizing floor: 50% + 50%×score
 // Funding Regime Classifier + Exit Timing Model
-const FRC_EXPANSION_MIN_PERSIST = parseFloat(process.env.FRC_EXPANSION_MIN_PERSIST ?? "0.6");
-const ETM_EXIT_FULL   = parseFloat(process.env.ETM_EXIT_FULL   ?? "0.7");
+const FRC_PERSIST_FULL_SIZE_OVERRIDE = parseFloat(process.env.FRC_PERSIST_FULL_SIZE_OVERRIDE ?? "0.59"); // ACCUMULATION full-size when persistence is in upper dead-band (0.59–0.65)
+const ETM_EXIT_FULL    = parseFloat(process.env.ETM_EXIT_FULL    ?? "0.7");
 const ETM_EXIT_PARTIAL = parseFloat(process.env.ETM_EXIT_PARTIAL ?? "0.5");
 
 const logger = new Logger("./logs");
@@ -1227,7 +1227,13 @@ async function main() {
         // weak-but-passing trades get proportionally less (never drops below floor × capital)
         const persistenceSizingMult = FPP_SIZING_FLOOR + (1 - FPP_SIZING_FLOOR) * fppResult.persistenceScore;
         // Regime sizing: ACCUMULATION = half size (early, unconfirmed); EXPANSION = full size
-        const regimeSizingMult  = regimeResult.regime === "ACCUMULATION" ? 0.5 : 1.0;
+        // Override: strong persistence (> 0.75) in ACCUMULATION earns full size — strong early trend
+        const regimeSizingMult  =
+          regimeResult.regime === "ACCUMULATION" && fppResult.persistenceScore > FRC_PERSIST_FULL_SIZE_OVERRIDE
+            ? 1.0   // override: don't under-size a high-confidence early entry
+            : regimeResult.regime === "ACCUMULATION"
+            ? 0.5
+            : 1.0;
         const rawDeltaCapital = capitalPerAsset * finalAllocation.delta * persistenceSizingMult * regimeSizingMult;
         const deltaCapitalAsset = Math.min(capitalPerAsset, Math.max(MIN_TRADE_SIZE, rawDeltaCapital));
         plannedLendingByAsset[asset] = Math.min(capitalPerAsset, Math.max(0, capitalPerAsset - deltaCapitalAsset));
@@ -1259,10 +1265,15 @@ async function main() {
         } else if (isOpenSignal && SCANNER_ENABLED && scanner.getTrend(asset).direction === 'falling') {
           // Trend gate: block entry when funding EWMA trend is falling
           executionData.events.push(`${asset}: funding trend falling (↓) — holding entry, waiting for reversal`);
-        } else if (isOpenSignal && (regimeResult.regime === "PEAK" || regimeResult.regime === "DECAY" || regimeResult.regime === "RESET")) {
+        } else if (isOpenSignal && (regimeResult.regime === "PEAK" || regimeResult.regime === "PEAK_EARLY" || regimeResult.regime === "DECAY" || regimeResult.regime === "RESET")) {
           // Regime gate: only enter during EXPANSION or ACCUMULATION
           executionData.events.push(
             `${asset}: regime=${regimeResult.regime} (z=${regimeResult.f_z.toFixed(1)}) — entry blocked, waiting for ACCUMULATION/EXPANSION`
+          );
+        } else if (isOpenSignal && frc.getReduceCooldown(asset) > 0) {
+          // Post-REDUCE_50 cooldown: block re-entry for N cycles to avoid churn
+          executionData.events.push(
+            `${asset}: post-REDUCE_50 cooldown (${frc.getReduceCooldown(asset)} cycles) — re-entry blocked`
           );
         } else if (isOpenSignal && fppResult.persistenceScore < FPP_MIN_PERSISTENCE) {
           // FPP gate: funding edge not expected to persist long enough

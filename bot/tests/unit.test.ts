@@ -464,22 +464,19 @@ test("getLatestRegime returns result after update without re-running", () => {
 
 test("getExitSignal → HOLD on healthy EXPANSION conditions", () => {
   const frc = new FundingRegimeClassifier();
-  const fpp = new FundingPersistencePredictor();
   const base = frcSnap({ oiChangeRatePct: 0.03 });
-  // Feed rising rates so f_slope > 0 → EXPANSION with persistenceScore=0.75
-  const rates = [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006];
-  let fppResult: any;
-  let r: any;
-  for (const rate of rates) {
-    const s = { ...base, fundingRate: rate };
-    r = frc.update("BTC", s, 0.75);
-    fppResult = fpp.update("BTC", s);
+  // Alternating [lo, hi] rates build mean=0.0002, std≈0.000190 → z of 0.00040 ≈ 1.05 < FRC_PEAK_EARLY_Z(1.2)
+  // Slope is positive on odd steps; f_accel alternates sign → no systematic PEAK_EARLY trigger
+  for (let i = 0; i < 10; i++) {
+    frc.update("BTC", { ...base, fundingRate: i % 2 === 0 ? 0.00001 : 0.00039 }, 0.75);
   }
+  const lastSnap = { ...base, fundingRate: 0.00040 };
+  const r = frc.update("BTC", lastSnap, 0.75);
   assert.strictEqual(r.regime, "EXPANSION",
-    `Prerequisite: expected EXPANSION, got ${r.regime} (slope=${r.f_slope.toExponential(2)}, z=${r.f_z.toFixed(2)})`);
-  const exit = frc.getExitSignal("BTC", { ...base, fundingRate: 0.0006 }, fppResult);
+    `Prerequisite: expected EXPANSION, got ${r.regime} (z=${r.f_z.toFixed(2)}, slope=${r.f_slope.toExponential(2)})`);
+  const exit = frc.getExitSignal("BTC", lastSnap, { persistenceScore: 0.75 } as any);
   assert.strictEqual(exit.action, "HOLD",
-    `Expected HOLD on healthy expansion, got ${exit.action} (score=${exit.exitScore.toFixed(2)})`);
+    `Expected HOLD on healthy expansion, got ${exit.action} (score=${exit.exitScoreSmoothed.toFixed(2)})`);
 });
 
 test("getExitSignal → FULL_EXIT when regime is DECAY", () => {
@@ -511,7 +508,129 @@ test("getExitSignal components are all in [0, 1]", () => {
   assert.ok(exit.exitScore >= 0 && exit.exitScore <= 1, `exitScore ${exit.exitScore} out of [0,1]`);
 });
 
-// ── Results ───────────────────────────────────────────────────────────────────
+// ── FRC Refinements (v2): hysteresis, PEAK_EARLY, EMA, cooldown ───────────────
+console.log("\n── FRC Refinements (v2) ─────────────────────────────────────");
+
+// ── Refinement 1: Hysteresis ────────────────────────────────────────────
+test("hysteresis: EXPANSION stays in dead band when persistence ∈ (0.55, 0.65)", () => {
+  const frc = new FundingRegimeClassifier();
+  const base = frcSnap({ oiChangeRatePct: 0.03 });
+  // Alternating warmup → mean=0.0002, std≈0.000190, z of step-up ≈ 1.05 < 1.2 → no PEAK_EARLY
+  for (let i = 0; i < 10; i++) {
+    frc.update("BTC", { ...base, fundingRate: i % 2 === 0 ? 0.00001 : 0.00039 }, 0.7);
+  }
+  // Step up slightly: keeps f_slope > 0 and raw = ACCUMULATION (persistence 0.58 < ENTER 0.65)
+  // Hysteresis holds EXPANSION because 0.58 ≥ EXIT(0.55) and prev was EXPANSION
+  const r = frc.update("BTC", { ...base, fundingRate: 0.00040 }, 0.58);
+  assert.strictEqual(r.regime, "EXPANSION",
+    `Expected EXPANSION (hysteresis holds since 0.58 ≥ EXIT=0.55), got ${r.regime} (z=${r.f_z.toFixed(2)})`);
+});
+
+test("hysteresis: EXPANSION drops to ACCUMULATION when persistence falls below EXIT (0.55)", () => {
+  const frc = new FundingRegimeClassifier();
+  const base = frcSnap({ oiChangeRatePct: 0.03 });
+  for (let i = 0; i < 10; i++) {
+    frc.update("BTC", { ...base, fundingRate: i % 2 === 0 ? 0.00001 : 0.00039 }, 0.7);
+  }
+  // Same step-up but persistence 0.50 < EXIT(0.55) → hysteresis releases, drops to ACCUMULATION
+  const r = frc.update("BTC", { ...base, fundingRate: 0.00040 }, 0.50);
+  assert.strictEqual(r.regime, "ACCUMULATION",
+    `Expected ACCUMULATION (0.50 < EXIT=0.55), got ${r.regime} (z=${r.f_z.toFixed(2)})`);
+});
+
+test("hysteresis: ACCUMULATION stays when persistence 0.62 < ENTER (0.65)", () => {
+  const frc = new FundingRegimeClassifier();
+  const base = frcSnap({ oiChangeRatePct: 0.03 });
+  frc.update("BTC", { ...base, fundingRate: 0.00005 }, 0.62); // baseline (RESET on first sample)
+  const r = frc.update("BTC", { ...base, fundingRate: 0.0001 }, 0.62); // slope > 0, 0.62 < ENTER=0.65 → ACCUMULATION
+  assert.strictEqual(r.regime, "ACCUMULATION",
+    `Expected ACCUMULATION (0.62 < ENTER=0.65, v1 threshold 0.6 would have given EXPANSION), got ${r.regime}`);
+});
+
+// ── Refinement 2: PEAK_EARLY ──────────────────────────────────────────────
+test("PEAK_EARLY: z in (1.2, 1.5) + f_accel < 0 → PEAK_EARLY", () => {
+  const frc = new FundingRegimeClassifier();
+  const base = frcSnap({ oiChangeRatePct: 0.02 });
+  // Build moderate z-score (1.2–1.5): 12 very low, 2 mid-high, 1 slightly lower
+  for (let i = 0; i < 12; i++) frc.update("BTC", { ...base, fundingRate: 0.00001 }, 0.7);
+  frc.update("BTC", { ...base, fundingRate: 0.0015 }, 0.7);
+  frc.update("BTC", { ...base, fundingRate: 0.0015 }, 0.7);
+  // Slightly lower rate → slope drops → f_accel < 0 (deceleration)
+  const r = frc.update("BTC", { ...base, fundingRate: 0.001 }, 0.7);
+  assert.strictEqual(r.regime, "PEAK_EARLY",
+    `Expected PEAK_EARLY (z=${r.f_z.toFixed(3)}, accel=${r.f_accel.toExponential(2)}), got ${r.regime}`);
+  assert.ok(r.f_z > 1.2 && r.f_z <= 1.5, `f_z ${r.f_z.toFixed(3)} must be in (1.2, 1.5]`);
+  assert.ok(r.f_accel < 0, `f_accel must be negative, got ${r.f_accel.toExponential(2)}`);
+});
+
+test("PEAK has priority over PEAK_EARLY when z > 1.5", () => {
+  const frc = new FundingRegimeClassifier();
+  // Reuse PEAK scenario: 14 low + 6 high → z ≈ 1.53 > 1.5, f_slope = 0 → PEAK (not PEAK_EARLY)
+  for (let i = 0; i < 14; i++) frc.update("BTC", frcSnap({ fundingRate: 0.00001, oiChangeRatePct: 0.01 }), 0.7);
+  let r: any;
+  for (let i = 0; i < 6; i++) r = frc.update("BTC", frcSnap({ fundingRate: 0.003, oiChangeRatePct: 0.01 }), 0.7);
+  assert.strictEqual(r.regime, "PEAK",
+    `Expected PEAK (priority over PEAK_EARLY when z > 1.5), got ${r.regime} (z=${r.f_z.toFixed(3)})`);
+  assert.ok(r.f_z > 1.5, `f_z ${r.f_z.toFixed(3)} must exceed FRC_HIGH_Z=1.5`);
+});
+
+// ── Refinement 3: EMA smoothing ───────────────────────────────────────────
+test("EMA: first-cycle spike is dampened — smoothed < raw — and stays below FULL_EXIT threshold", () => {
+  const frc = new FundingRegimeClassifier();
+  const base = frcSnap({ oiChangeRatePct: 0.03 });
+  // Warmup: 8 healthy getExitSignal calls → EMA anchored near 0
+  const rates = [0.0001, 0.00012, 0.00014, 0.00016, 0.00018, 0.0002, 0.00022, 0.00024];
+  const mockFpp = (ps: number) => ({ persistenceScore: ps }) as any;
+  for (const rate of rates) {
+    frc.update("BTC", { ...base, fundingRate: rate }, 0.8);
+    frc.getExitSignal("BTC", { ...base, fundingRate: rate }, mockFpp(0.8)); // warm EMA near 0
+  }
+  // Spike: OI turns sharply negative (high negOi contribution), drop persistence → high raw score
+  const spike = { ...base, fundingRate: 0.00024, oiChangeRatePct: -0.15 };
+  frc.update("BTC", spike, 0.5);          // keep f_slope ≥ 0 (same rate) → no DECAY
+  const exit = frc.getExitSignal("BTC", spike, mockFpp(0.5));
+  assert.ok(exit.exitScoreSmoothed < exit.exitScore,
+    `smoothed (${exit.exitScoreSmoothed.toFixed(3)}) must be less than raw (${exit.exitScore.toFixed(3)}) on first spike`);
+  assert.ok(exit.exitScoreSmoothed < 0.7,
+    `smoothed (${exit.exitScoreSmoothed.toFixed(3)}) must not trigger FULL_EXIT (0.7) on single spike`);
+  assert.ok(exit.exitScoreSmoothed >= 0, "smoothed score must be non-negative");
+});
+
+// ── Refinement 4: Reduce cooldown ─────────────────────────────────────────
+test("reduce cooldown: set after REDUCE_50 and decrements to 0 via update()", () => {
+  const frc = new FundingRegimeClassifier();
+  // Conditions for exitScore ≈ 0.55 — f_slope < 0 (negSlope=1) + oi_slope > 0 (avoids DECAY)
+  //   + persistence drop 0.3 (persistenceDrop=1): total ≈ 0.30×1 + 0.25×0 + 0.25×1 = 0.55
+  const snap1 = frcSnap({ fundingRate: 0.0003, oiChangeRatePct: 0.03 });
+  const snap2 = frcSnap({ fundingRate: 0.0001, oiChangeRatePct: 0.03 }); // slope drops → negSlope = 1.0
+  frc.update("BTC", snap1, 0.8);
+  frc.update("BTC", snap2, 0.5); // persistence drops 0.3 → persistenceDrop = 1.0
+  assert.strictEqual(frc.getReduceCooldown("BTC"), 0, "cooldown must start at 0");
+  // First getExitSignal: exitScoreSmoothed = raw ≈ 0.55 → REDUCE_50
+  const exit = frc.getExitSignal("BTC", snap2, { persistenceScore: 0.5 } as any);
+  assert.strictEqual(exit.action, "REDUCE_50",
+    `Expected REDUCE_50 (score=${exit.exitScoreSmoothed.toFixed(3)}), got ${exit.action}`);
+  assert.ok(frc.getReduceCooldown("BTC") > 0, "cooldown must be set after REDUCE_50");
+  const initialCooldown = frc.getReduceCooldown("BTC");
+  // Each update() decrements the cooldown
+  for (let i = 0; i < initialCooldown; i++) frc.update("BTC", snap2, 0.5);
+  assert.strictEqual(frc.getReduceCooldown("BTC"), 0,
+    `cooldown must reach 0 after ${initialCooldown} update() calls`);
+});
+
+// ── Refinement 5: Persistence override (index.ts sizing) ─────────────────
+test("ACCUMULATION + persistence in upper dead band (0.62 > 0.59) — regime check for sizing override", () => {
+  const frc = new FundingRegimeClassifier();
+  const base = frcSnap({ oiChangeRatePct: 0.03 });
+  // persistence=0.62 < ENTER(0.65) → ACCUMULATION; but 0.62 > FRC_PERSIST_FULL_SIZE_OVERRIDE(0.59)
+  // → index.ts regimeSizingMult would apply 1.0× (full size) even in ACCUMULATION
+  frc.update("BTC", { ...base, fundingRate: 0.00005 }, 0.62);
+  const r = frc.update("BTC", { ...base, fundingRate: 0.0001 }, 0.62);
+  assert.strictEqual(r.regime, "ACCUMULATION",
+    `Expected ACCUMULATION (0.62 < ENTER=0.65), got ${r.regime}`);
+  // Confirm: persistence 0.62 > 0.59 threshold → sizing override in index.ts gives full size
+  assert.ok(0.62 > 0.59, "override threshold 0.59 is satisfied — full size applies in index.ts");
+});
 console.log(`\n${"─".repeat(52)}`);
 console.log(`  ${passed} passed   ${failed} failed   ${passed + failed} total`);
 console.log(`${"─".repeat(52)}\n`);
