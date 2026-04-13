@@ -86,12 +86,21 @@ const MAX_ABSOLUTE_FUNDING_APR = parseFloat(process.env.FUNDING_CIRCUIT_BREAKER_
 const MAX_GROSS_NOTIONAL_RATIO = parseFloat(process.env.MAX_GROSS_NOTIONAL_RATIO ?? "1.5");
 // Bybit venue routing: route to Bybit when its APR exceeds HL by at least this spread
 const BYBIT_ARB_MIN_SPREAD = parseFloat(process.env.BYBIT_ARB_MIN_SPREAD_APR ?? "0.02");
-// Slippage guard: if perp fill slippage exceeds this fraction, abort the trade and close immediately
-const MAX_SLIPPAGE_PCT = parseFloat(process.env.MAX_SLIPPAGE_PCT ?? "0.003"); // 0.3% default
 
 // Comma-separated assets to trade, e.g. "BTC,ETH,SOL,JTO"
 const TRADING_ASSETS = (process.env.TRADING_ASSETS ?? "BTC,ETH,SOL,JTO")
   .split(",").map(s => s.trim()).filter(Boolean);
+
+// Phase 5: power-law score weighting exponent (1.0 = linear legacy, 1.3 = recommended)
+const SCORE_POWER = parseFloat(process.env.SCORE_POWER ?? "1.3");
+// Phase 5: two-tier slippage — warn/pause vs abort+unwind
+const SLIPPAGE_WARN_PCT    = parseFloat(process.env.SLIPPAGE_WARN_PCT  ?? process.env.MAX_SLIPPAGE_PCT ?? "0.003");
+const SLIPPAGE_ABORT_PCT   = parseFloat(process.env.SLIPPAGE_ABORT_PCT ?? "0.005");
+const SLIPPAGE_PAUSE_CYCLES = parseInt(process.env.SLIPPAGE_PAUSE_CYCLES ?? "5");
+// Phase 5: auto kill switch thresholds
+const AUTO_HALT_1H_PCT        = parseFloat(process.env.AUTO_HALT_1H_PCT         ?? "0.02"); // -2%
+const AUTO_HALT_24H_PCT       = parseFloat(process.env.AUTO_HALT_24H_PCT        ?? "0.05"); // -5%
+const AUTO_HALT_HL_LATENCY_MS = parseFloat(process.env.AUTO_HALT_HL_LATENCY_MS ?? "5000");
 
 const logger = new Logger("./logs");
 
@@ -222,7 +231,11 @@ async function main() {
   const fundingCircuitBreakers = new Set<string>(); // assets blocked due to extreme funding APR
   const tradeHistory: TradeRecord[] = [];           // last 100 completed trades
   let manualHalt = false;                           // kill switch — set via POST /admin/halt
+  let autoHalt   = false;                           // machine-set — cleared when triggers normalize
+  interface PnlCheckpoint { ts: number; pnl: number; }
+  const pnlCheckpoints: PnlCheckpoint[] = [];       // rolling PnL history for auto-halt drawdown checks
   let scoreWeightMap: Map<string, number> = new Map(); // score-weighted capital share per asset
+  const slippagePausedUntil = new Map<string, number>(); // asset → timestamp when slippage pause expires
   let tick = 0;
   let simulatedPnl = 0; // Simulated profit for demo
   let cumulativeRealizedPnl = 0; // Running total of closed-position PnL
@@ -401,6 +414,21 @@ async function main() {
     if (samples.length < 2) return 0.0001;
     const mean = samples.reduce((s, v) => s + v, 0) / samples.length;
     return samples.reduce((s, v) => s + (v - mean) ** 2, 0) / samples.length;
+  }
+
+  /** Pearson correlation between two return series — used for dynamic BTC/ETH haircut. */
+  function pearsonCorr(xs: number[], ys: number[]): number {
+    const n = Math.min(xs.length, ys.length);
+    if (n < 5) return 0.85; // assume high correlation with insufficient data
+    const xSlice = xs.slice(-n), ySlice = ys.slice(-n);
+    const xMean = xSlice.reduce((s, v) => s + v, 0) / n;
+    const yMean = ySlice.reduce((s, v) => s + v, 0) / n;
+    const num   = xSlice.reduce((s, v, i) => s + (v - xMean) * (ySlice[i] - yMean), 0);
+    const denom = Math.sqrt(
+      xSlice.reduce((s, v) => s + (v - xMean) ** 2, 0) *
+      ySlice.reduce((s, v) => s + (v - yMean) ** 2, 0)
+    );
+    return denom > 0 ? num / denom : 0.85;
   }
 
   // ── applyAssetSetChange ─────────────────────────────────────────────────────
@@ -661,6 +689,36 @@ async function main() {
       else if (latencyMs > 500) await telegram.networkCongested(latencyMs);
       if (oracleAgeS > 30)  await telegram.oracleStale("BTC", Math.round(oracleAgeS));
 
+      // ── Auto kill switch: drawdown + HL latency ───────────────────────────────
+      if (!manualHalt) {
+        const now = Date.now();
+        // Compute current PnL from shared vars (same formula as strategy loop)
+        const openFY = Array.from(positions.values()).reduce((s, p) => s + (p.fundingAccrued ?? 0), 0);
+        const currentPnl = cumulativeRealizedPnl + cumulativeLendingYield + openFY;
+        pnlCheckpoints.push({ ts: now, pnl: currentPnl });
+        // Trim to last 25h of history
+        const cut25h = now - 25 * 3600_000;
+        while (pnlCheckpoints.length > 0 && pnlCheckpoints[0].ts < cut25h) pnlCheckpoints.shift();
+
+        const cp1h  = [...pnlCheckpoints].reverse().find(c => c.ts <= now - 3600_000);
+        const cp24h = [...pnlCheckpoints].reverse().find(c => c.ts <= now - 86400_000);
+        const dd1h  = cp1h  ? (currentPnl - cp1h.pnl)  / Math.max(vaultEquity, 1) : 0;
+        const dd24h = cp24h ? (currentPnl - cp24h.pnl) / Math.max(vaultEquity, 1) : 0;
+
+        const latencyBreach   = hlLatencyMs > AUTO_HALT_HL_LATENCY_MS;
+        const drawdownBreach  = dd1h < -AUTO_HALT_1H_PCT || dd24h < -AUTO_HALT_24H_PCT;
+
+        if ((latencyBreach || drawdownBreach) && !autoHalt) {
+          autoHalt = true;
+          if (dd1h < -AUTO_HALT_1H_PCT)    logger.risk(`[AUTO-HALT] 1h drawdown ${(dd1h * 100).toFixed(2)}% < -${(AUTO_HALT_1H_PCT * 100).toFixed(0)}% — halting new entries`);
+          if (dd24h < -AUTO_HALT_24H_PCT)  logger.risk(`[AUTO-HALT] 24h drawdown ${(dd24h * 100).toFixed(2)}% < -${(AUTO_HALT_24H_PCT * 100).toFixed(0)}% — halting new entries`);
+          if (latencyBreach)               logger.risk(`[AUTO-HALT] HL latency ${hlLatencyMs}ms > ${AUTO_HALT_HL_LATENCY_MS}ms — halting new entries`);
+        } else if (!latencyBreach && !drawdownBreach && autoHalt) {
+          autoHalt = false;
+          logger.info("[AUTO-HALT] All triggers normalized — auto-halt lifted");
+        }
+      }
+
     } catch (e: any) { logger.error(`Risk loop: ${e.message}`); }
   }, RISK_CYCLE_MS);
 
@@ -747,24 +805,34 @@ async function main() {
         scanner.updateCycle();
         if (scanner.shouldRescan()) {
           const result = await scanner.scan();
-          // Build score-weighted capital shares + BTC/ETH correlation haircut
+          // Build score-weighted capital shares — power-law exponent concentrates capital on top scorers
           {
             const scanEntries = scanner.getLastScanEntries().filter(e => e.selected);
-            const scoreSum = scanEntries.reduce((s, e) => s + Math.max(0, e.compositeScore), 0);
-            scoreWeightMap = new Map(scanEntries.map(e => [
-              e.asset,
-              scoreSum > 0 ? Math.max(0, e.compositeScore) / scoreSum : 1 / scanEntries.length
+            const powered = scanEntries.map(e => ({
+              asset: e.asset,
+              pw: Math.pow(Math.max(0, e.compositeScore), SCORE_POWER),
+            }));
+            const pwSum = powered.reduce((s, x) => s + x.pw, 0);
+            scoreWeightMap = new Map(powered.map(x => [
+              x.asset,
+              pwSum > 0 ? x.pw / pwSum : 1 / powered.length,
             ]));
+
+            // Dynamic BTC/ETH correlation haircut (replaces static 20%)
             if (scoreWeightMap.has("BTC") && scoreWeightMap.has("ETH")) {
-              const ethW  = scoreWeightMap.get("ETH")! * 0.80;
-              const freed = scoreWeightMap.get("ETH")! - ethW;
+              const btcReturns = marketEngine.getPriceReturns("BTC");
+              const ethReturns = marketEngine.getPriceReturns("ETH");
+              const corr    = pearsonCorr(btcReturns, ethReturns);
+              const haircut = Math.max(0, (corr - 0.80) * 1.5); // 0 at corr≤0.80, 22.5% at corr=0.95
+              const ethW    = scoreWeightMap.get("ETH")! * (1 - haircut);
+              const freed   = scoreWeightMap.get("ETH")! - ethW;
               scoreWeightMap.set("ETH", ethW);
-              const others    = [...scoreWeightMap.keys()].filter(a => a !== "BTC" && a !== "ETH");
-              const otherSum  = others.reduce((s, a) => s + scoreWeightMap.get(a)!, 0);
-              if (otherSum > 0) {
+              const others   = [...scoreWeightMap.keys()].filter(a => a !== "BTC" && a !== "ETH");
+              const otherSum = others.reduce((s, a) => s + scoreWeightMap.get(a)!, 0);
+              if (otherSum > 0 && freed > 0) {
                 for (const a of others) scoreWeightMap.set(a, scoreWeightMap.get(a)! + freed * (scoreWeightMap.get(a)! / otherSum));
               }
-              logger.info(`[SCANNER] BTC/ETH correlation haircut applied — ETH weight reduced 20%, redistributed to ${others.join(", ") || "none"}`);
+              logger.info(`[SCANNER] BTC/ETH corr=${corr.toFixed(3)} → haircut=${(haircut * 100).toFixed(1)}%, redistributed ${freed > 0 ? "to " + (others.join(", ") || "none") : "nothing freed"}`);
             }
           }
           if (result.changed) {
@@ -967,13 +1035,20 @@ async function main() {
         if (isOpenSignal && hasOpenPosition) {
           logger.info(`${asset}: Position already open — skipping new ${signal.signal}`);
           executionData.events.push(`${asset}: position already open — skipped duplicate entry`);
-        } else if (isOpenSignal && manualHalt) {
-          executionData.events.push(`${asset}: manual halt active — all new entries blocked`);
+        } else if (isOpenSignal && (manualHalt || autoHalt)) {
+          const reason = manualHalt ? "manual halt active" : "auto-halt active";
+          executionData.events.push(`${asset}: ${reason} — all new entries blocked`);
         } else if (isOpenSignal && drainingAssets.has(asset)) {
           // Asset is being retired — let existing positions close, block new opens
           executionData.events.push(`${asset}: draining — no new entries until position closes`);
         } else if (isOpenSignal && fundingCircuitBreakers.has(asset)) {
           executionData.events.push(`${asset}: circuit breaker active — funding APR too extreme for new entry`);
+        } else if (isOpenSignal && slippagePausedUntil.has(asset) && Date.now() < slippagePausedUntil.get(asset)!) {
+          const remainS = Math.ceil((slippagePausedUntil.get(asset)! - Date.now()) / 1000);
+          executionData.events.push(`${asset}: slippage pause — ${remainS}s remaining`);
+        } else if (isOpenSignal && SCANNER_ENABLED && scanner.getTrend(asset).direction === 'falling') {
+          // Trend gate: block entry when funding EWMA trend is falling
+          executionData.events.push(`${asset}: funding trend falling (↓) — holding entry, waiting for reversal`);
         } else if (isOpenSignal) {
           const blockedByAgent = agentDecision?.action === "SKIP" && agentDecision.asset === asset;
 
@@ -1093,7 +1168,7 @@ async function main() {
               }
 
               if (!DEMO_MODE) {
-                const liveExec = await handleSignalLive(signal, asset, executionSizeUSD, hlExecutor, jupiterSwap, marginFi, positions, logger, bybitExecutor, cexRates);
+                const liveExec = await handleSignalLive(signal, asset, executionSizeUSD, hlExecutor, jupiterSwap, marginFi, positions, logger, bybitExecutor, cexRates, slippagePausedUntil);
                 if (liveExec.events.length > 0) {
                   executionData.events.push(...liveExec.events);
                 }
@@ -1327,6 +1402,7 @@ async function main() {
       };
       botState.tradeHistory = tradeHistory.slice(-100);
       botState.manualHalt   = manualHalt;
+      botState.autoHalt     = autoHalt;
 
       // ── Organized Logging (gated to every LOG_EVERY_N cycles) ─────────────
       if (shouldLog) {
@@ -1452,7 +1528,8 @@ async function handleSignalLive(
   positions: Map<string, any>,
   logger: Logger,
   bybitExecutor?: BybitExecutor,
-  cexRates?: CexFundingRates
+  cexRates?: CexFundingRates,
+  slippagePausedUntil?: Map<string, number>
 ): Promise<{ executed: boolean; events: string[]; realizedPnl?: number; tradeRecord?: TradeRecord }> {
   const events: string[] = [];
   let executed = false;
@@ -1586,15 +1663,20 @@ async function handleSignalLive(
             : await hlExec.openLong(asset, executionSizeUSD, signal.metadata.perpPrice);
         }
 
-        // Slippage guard: if perp fill slippage exceeds MAX_SLIPPAGE_PCT, abort and unwind
-        if (perpOrderResult && perpOrderResult.slippagePct > MAX_SLIPPAGE_PCT) {
-          logger.warn(`[SLIPPAGE_ABORT] ${asset}: slippage ${(perpOrderResult.slippagePct * 100).toFixed(3)}% > ${(MAX_SLIPPAGE_PCT * 100).toFixed(3)}% limit — unwinding`);
-          // Close perp (use IOC market close — no size arg needed, uses full position)
+        // Two-tier slippage guard
+        if (perpOrderResult && perpOrderResult.slippagePct > SLIPPAGE_ABORT_PCT) {
+          // Tier 2: severe — unwind immediately
+          logger.warn(`[SLIPPAGE_ABORT] ${asset}: slippage ${(perpOrderResult.slippagePct * 100).toFixed(3)}% > abort threshold ${(SLIPPAGE_ABORT_PCT * 100).toFixed(1)}% — unwinding`);
           await hlExec.closePosition(asset).catch(() => {});
-          // Remove spot if already set this cycle
           if (positions.has(`${asset}_SPOT`)) positions.delete(`${asset}_SPOT`);
-          events.push(`${asset}: SLIPPAGE_ABORT — trade unwound (slippage ${(perpOrderResult.slippagePct * 100).toFixed(3)}%)`);
+          events.push(`${asset}: SLIPPAGE_ABORT tier-2 — trade unwound (${(perpOrderResult.slippagePct * 100).toFixed(3)}%)`);
           break;
+        } else if (perpOrderResult && perpOrderResult.slippagePct > SLIPPAGE_WARN_PCT) {
+          // Tier 1: moderate — keep position, pause pair for N cycles
+          const pauseMs = SLIPPAGE_PAUSE_CYCLES * CYCLE_MS;
+          if (slippagePausedUntil) slippagePausedUntil.set(asset, Date.now() + pauseMs);
+          logger.warn(`[SLIPPAGE_WARN] ${asset}: slippage ${(perpOrderResult.slippagePct * 100).toFixed(3)}% > warn threshold — position kept, pair paused ${SLIPPAGE_PAUSE_CYCLES} cycles`);
+          events.push(`${asset}: SLIPPAGE_WARN — position kept; next entry paused ${SLIPPAGE_PAUSE_CYCLES} cycles`);
         }
 
         positions.set(`${asset}_PERP`, {

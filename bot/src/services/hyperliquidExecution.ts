@@ -418,6 +418,16 @@ export class HLMarketDataEngine {
     return new Map(this.store);
   }
 
+  /** Percent-change returns derived from priceHistory ring (no new API call). */
+  getPriceReturns(asset: string): number[] {
+    const px = this.priceHistory.get(asset) ?? [];
+    const returns: number[] = [];
+    for (let i = 1; i < px.length; i++) {
+      returns.push(px[i] > 0 ? (px[i] - px[i - 1]) / px[i - 1] : 0);
+    }
+    return returns;
+  }
+
   /** Refresh all snapshots. Called manually each strategy cycle. */
   async refresh(): Promise<void> {
     const now = Date.now();

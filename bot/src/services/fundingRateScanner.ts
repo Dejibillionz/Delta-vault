@@ -51,6 +51,7 @@ const EWMA_ALPHA     = 0.15;
 const MAX_RING       = 20;
 const TREND_RING     = 5;    // EWMA samples kept for slope/trend detection
 const DEFAULT_ASSETS = ["BTC", "ETH", "SOL", "JTO"];
+const ATR_TARGET_PCT = parseFloat(process.env.ATR_TARGET_VOL_PCT ?? "0.02"); // 2% price stdDev baseline
 
 // ── FundingRateScanner ─────────────────────────────────────────────────────────
 
@@ -181,11 +182,11 @@ export class FundingRateScanner {
       const oiVelMult     = oiVelocityPct < -0.05 ? 0.80 :
                             oiVelocityPct < -0.02 ? 0.90 : 1.00;
 
-      // ATR multiplier: high price volatility → penalise (harder to stay delta-neutral)
+      // ATR multiplier: smooth inverse-square curve above ATR_TARGET_PCT baseline
       const atrPct    = snap.atrPct ?? 0;
-      const atrMult   = atrPct > 0.05 ? 0.75 :   // >5% price stdDev → risky
-                        atrPct > 0.02 ? 0.90 :   // 2-5% → caution
-                        1.00;
+      const atrMult   = atrPct <= ATR_TARGET_PCT
+        ? 1.0
+        : Math.max(0.10, Math.pow(ATR_TARGET_PCT / atrPct, 2));
 
       // Composite: 50% funding | 30% stability | 20% liquidity — then trend + CEX + OI velocity + ATR
       const compositeScore =
