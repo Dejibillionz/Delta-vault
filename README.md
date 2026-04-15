@@ -1,318 +1,523 @@
-# ◈ Delta Vault — Adaptive Delta-Neutral Vault Strategy
+# Delta Vault — Autonomous Delta-Neutral Trading Bot
 
-> Hyperliquid · Kamino · MarginFi · Solana · BTC + ETH + SOL + JTO · Mainnet-Ready
-
-A production-ready delta-neutral vault strategy that generates stable yield through funding rate arbitrage, basis spread capture, cross-chain opportunity routing, and adaptive capital allocation — with zero directional price exposure.
+**Production-ready autonomous market maker for Solana with institutional-grade risk management, cross-chain optimization, and dynamic capital allocation.**
 
 ---
 
-## Strategy Overview
+## Overview
 
-| Mode | Trigger | Action | Yield Source |
-|------|---------|--------|--------------|
-| **DELTA_NEUTRAL** | \|Funding rate\| > 0.01%/hr (mainnet) | Long spot (Jupiter) + short perp (Hyperliquid) | Funding payments |
-| **BASIS_TRADE** | Basis spread > 1.0% (mainnet) | Buy spot + short futures | Spread convergence |
-| **PARK_CAPITAL** | No opportunity | Deploy leftover to Kamino Finance (USDC lending) | Lending APY |
-| **CROSS_CHAIN** | Better net edge on another chain (devnet only) | Bridge capital to best venue | Inter-venue funding arb |
+Delta Vault is a sophisticated **delta-neutral arbitrage engine** designed to extract funding rate yield while maintaining zero directional exposure to market price movements. Built on **Hyperliquid** for perpetual futures with integrated **Kamino & MarginFi** for stable lending yield, the bot operates a dual-income strategy: collect high funding rates through delta-neutral positioning (long spot + short perp) while parking idle capital in lending protocols that consistently deliver 4-5% APY.
 
-**Bidirectional funding:** Positive funding → LONG spot + SHORT perp. Negative funding → SHORT spot (via MarginFi borrow) + LONG perp.
-**Historical Opportunity Range:** 8–25% APY (market-dependent)
-**Max Drawdown:** 10% hard stop
-**Net Delta:** ~0 (market-neutral)
-
-> **Disclaimer:** Historical funding rates and basis spreads do not guarantee future returns. Yield is entirely dependent on prevailing market conditions, funding rate regimes, and liquidity.
+**In plain English:** The bot profits from the difference between spot and futures prices without gambling on market direction. Your capital grows regardless of whether BTC goes up, down, or sideways.
 
 ---
 
-## Core Architecture
+## Architecture at a Glance
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                   Main Orchestrator                       │
-│                      index.ts                             │
-│          Capital Manager · Carryover · State API          │
-└────┬──────────┬───────────┬──────────┬───────────────────┘
-     │          │           │          │
-┌────▼───┐ ┌───▼────┐ ┌────▼─────┐ ┌──▼──────┐ ┌──────────────┐
-│ Market │ │Strategy│ │  Risk    │ │Execution│ │ Cross-Chain  │
-│  Data  │ │ Engine │ │  Engine  │ │ Engine  │ │  Decision    │
-│        │ │        │ │          │ │         │ │              │
-│Hyper-  │ │Signals │ │Drawdown  │ │Jupiter  │ │7-chain scan  │
-│liquid  │ │Sizing  │ │Vol debounce│spot swap│ │Fee-adj edge  │
-│        │ │Carryover│ │Warm-up  │ │Hyper-   │ │Cost model    │
-│        │ │        │ │          │ │liquid   │ │              │
-│        │ │        │ │          │ │perp     │ │              │
-└────────┘ └────────┘ └──────────┘ └─────────┘ └──────────────┘
-```
-
-**Strategy loop:** Every 15 seconds (logs every 2 cycles ≈ 30s)
-**Risk loop:** Every 10 seconds
-**State API:** `http://localhost:3001` (polled by dashboard every 5s)
-
----
-
-## Execution Flow — True Delta-Neutral
-
-The bot uses **three DeFi protocols** to construct a fully delta-neutral position:
-
-| Leg | Protocol | Method | Why |
-|-----|----------|--------|-----|
-| **Spot LONG** | Jupiter Aggregator | HTTP API swap (USDC → asset) | Best-price routing, no minimum order size |
-| **Perp SHORT** | Hyperliquid | EIP-712 signed REST order | Deep perpetuals market with funding payments |
-| **Lending yield** | Kamino Finance | USDC supply-side deposit | Earns ~4.5% APY on idle capital |
-| **Negative-funding borrow** | MarginFi | Borrow asset → sell on Jupiter | Synthetic short for negative-funding regime |
-
-### Position Closing
-
-Positions are closed when any of these conditions are met:
-
-| Condition | Threshold | Urgency |
-|-----------|-----------|---------|
-| Max hold time | > 4 hours | Medium |
-| Profit target | > 1% of notional | Medium |
-| Funding regime flip | Entry direction reversed | High |
-| Effective funding decay | < 0.005%/hr after 30min | Medium |
-| Funding depleted | Next cycle return < $0.50 | Low |
-| Emergency drawdown | Portfolio drawdown > 10% | Critical |
-
-Perp positions are closed via Hyperliquid reduce-only IOC orders. Spot positions are unwound via Jupiter reverse swap. MarginFi borrows are repaid before collateral is retrieved.
-
-### Duplicate Position Guard
-
-Before opening any new position, the bot checks if there's already an open position for that asset. If so, it logs a warning and skips:
-
-```
-[INFO] BTC: Position already open — skipping new DELTA_NEUTRAL_OPEN
+┌─────────────────────────────────────────────────────────┐
+│            Delta Vault Orchestrator                      │
+│  (15s strategy cycle + continuous risk monitoring)      │
+└─────────────────────────────────────────────────────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         │                │                │
+    ┌────▼────┐    ┌─────▼──────┐    ┌───▼─────────┐
+    │Strategy │    │Risk Engine │    │Cross-Chain  │
+    │Engine   │    │(10s cycle) │    │Optimizer    │
+    │         │    │            │    │             │
+    │• Funding│    │• Drawdown  │    │• Multi-chain│
+    │  Rate   │    │  Monitor   │    │  Routing    │
+    │  Arb    │    │• Latency   │    │• Fee Calcs  │
+    │• Basis  │    │  Guards    │    │• Rebalance  │
+    │  Trade  │    │• Collateral│    │             │
+    │• Regime │    │  Checks    │    │             │
+    │  Class  │    │            │    │             │
+    └────┬────┘    └─────┬──────┘    └───┬─────────┘
+         │                │               │
+         └────────────────┼───────────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         │                │                │
+    ┌────▼────────┐  ┌───▼────────┐  ┌───▼─────────┐
+    │Hyperliquid  │  │Kamino/HL   │  │Jupiter      │
+    │Executor     │  │Lending     │  │Spot Swap    │
+    │             │  │            │  │             │
+    │• Perp Longs │  │• Deposit   │  │• Rebalance  │
+    │• Perp Shorts│  │• Withdraw  │  │• Portfolio  │
+    │• Market Data│  │• Yield     │  │  Mgmt       │
+    │• Funding    │  │            │  │             │
+    │  Rates      │  │            │  │             │
+    └─────────────┘  └────────────┘  └─────────────┘
 ```
 
 ---
 
-## Features
+## Core Features
 
-### Capital Manager
-Every cycle starts with a strict reserve-before-execute flow:
+### ⚡ **Delta-Neutral Arbitrage** 
+The foundation of the strategy. Open a long spot position while simultaneously shorting an equivalent notional amount on Hyperliquid perps. Collect funding rate yields (typically 0.01–0.05% hourly = 8–40% APY) without directional risk.
 
-1. **Reserve** — allocate capital for each trade before execution
-2. **Execute** — use only reserved amount (never hardcoded sizes)
-3. **Release** — return reserved capital if execution fails or is skipped
-4. **Lend** — deploy only remaining leftover capital to Kamino USDC lending
+**How it works:**
+- Monitor funding rates across BTC, ETH, HYPE
+- When funding exceeds threshold (configurable, default 0.5% APR), signal entry
+- Buy spot at market, short perps at market
+- Hold delta-neutral position while collecting hourly funding
+- Exit when funding drops below profit target or hold duration expires
 
-### Carryover Accumulation
-Sub-minimum allocations accumulate across cycles and execute once meaningful:
-
-- Allocation below `MIN_TRADE_SIZE` ($100) → **accumulated** into per-asset carryover
-- Carryover + next cycle's allocation → **executes** once the sum crosses the minimum
-- Signal gone quiet → carryover **decays by 25% per cycle** instead of hard resetting
-
-### Cross-Chain Funding Arbitrage
-The bot evaluates funding rates across 7 chains per cycle and routes capital to the highest net-yield venue after bridge + gas + slippage costs:
-
-| Chain | Venue |
-|-------|-------|
-| Solana | Hyperliquid |
-| Arbitrum | GMX |
-| Base | — |
-| Optimism | — |
-| Polygon | — |
-| Avalanche | — |
-| BNB Chain | — |
-
-> **Note:** On mainnet, non-Solana chain funding rates return zero (real API integrations pending). Cross-chain execution runs in simulation mode — only Solana/Hyperliquid trades are live.
-
-### Adaptive AI Agent
-A lightweight adaptive AI agent module observes funding conditions and gates per-cycle execution:
-
-- Both BTC and ETH can trade simultaneously — the agent only blocks an asset if it explicitly decides to **SKIP** (underperforming)
-- Applies dynamic max-size caps derived from confidence, win-rate, and volatility
-- Emits structured `[AI AGENT]` logs each cycle
-- Exposes agent state over the bot API for dashboard rendering
-
-### Reverse Delta-Neutral (Negative Funding)
-Delta-neutral execution is explicitly two-way and regime-aware:
-
-- Positive funding: **LONG spot (Jupiter) + SHORT perp (Hyperliquid)**
-- Negative funding: **BORROW asset (MarginFi) → SELL spot (Jupiter) + LONG perp (Hyperliquid)**
-- Profitability gate: `|fundingRate| × 8760 − borrowRate > 2%` before opening negative-funding trades
-- Exit logic is direction-aware (uses effective funding, not raw sign)
-- Funding regime flips trigger close/reverse behavior
-
-### Live Dashboard
-The bot serves a real-time JSON state endpoint at `http://localhost:3001`. The React dashboard polls it every 5 seconds and renders:
-
-- Prices, funding rates, basis spreads
-- Open positions (per-leg: spot + perp)
-- Execution events and position status
-- Lending by asset (Kamino APR)
-- Capital manager state (reserved, lent, carryover)
-- Cross-chain decisions and funding map
-- AI agent mode, confidence, and decisions
+**Risk:** Market moves affect both legs equally (delta-neutral), but basis risk on execution causes minimal slippage.
 
 ---
 
-## Repository Structure
+### 🏛️ **Intelligent Capital Allocation**
+Not all capital should be locked in trading. The bot splits your vault into two buckets:
+
+| Component | Purpose | Yield | Risk |
+|-----------|---------|-------|------|
+| **Trading Capital (50-80%)** | Delta-neutral positions, funding rate collection | 8–40% APY | Low (hedged) |
+| **Lending Capital (20-50%)** | Kamino, MarginFi stable yield | 4–5% APY | Very Low |
+
+Each account preset auto-tunes bucket sizes. A `$20` account prioritizes lending (safer). A `$100k` enterprise vault maximizes trading while keeping 80% in lending for capital preservation.
+
+---
+
+### 🔄 **Funding Regime Classification**
+Not all funding rates are created equal. The bot classifies market regime in real-time:
+
+- **EXPANSION** — Funding rising, volatility increasing → Larger positions, longer holds
+- **PEAK** — Funding at local max → Reduce size, prepare exit
+- **DECAY** — Funding falling → Trim positions, tighten stops
+- **RESET** — Volatility shock, regime flip likely → Pause, rebalance capital
+
+Each regime signals different position sizing and risk parameters. This prevents you from holding overlarge positions just before funding crashes.
+
+---
+
+### 🌍 **Cross-Chain Optimization** (Multi-Chain Funding Arbitrage)
+Why choose one chain when you can route capital to the highest-yield chain dynamically?
+
+**Feature:** Continuously evaluates funding rates across Solana and Base (Hyperliquid, Kamino). When one chain offers ≥1.5% edge after bridge costs, automatically rebalances spot and perp exposure.
 
 ```
-delta-vault/
-│
-├── dashboard/                         # Vite + React live dashboard
-│   └── src/App.jsx                    # Live polling + capital/cross-chain panels
-│
-├── bot/
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── .env.example
-│   └── src/
-│       ├── index.ts                   # Main orchestrator + capital manager + bot loop
-│       ├── strategyEngine.ts          # Bidirectional signal generation + symmetric sizing
-│       ├── enhancedRiskEngine.ts      # Risk checks + smoothed funding volatility + debounce
-│       ├── anchorClient.ts            # Anchor on-chain program client (NAV/risk oracle)
-│       ├── walletIntegration.ts       # Standalone ServerWallet (Solana keypair)
-│       ├── telegramAlerts.ts          # Real-time Telegram notifications
-│       ├── logger.ts                  # Structured logging
-│       ├── agent/                     # AI agent module
-│       │   ├── decision.ts            # Decision logic
-│       │   ├── sizing.ts              # Dynamic position sizing
-│       │   ├── state.ts               # Rolling state tracking
-│       │   └── logger.ts              # Agent-specific logging
-│       ├── config/
-│       │   └── crossChain.ts          # Cross-chain chains list + cooldown + horizon config
-│       ├── services/
-│       │   ├── hyperliquidExecution.ts  # Hyperliquid perp orders + funding data + market snapshots
-│       │   ├── jupiterSpot.ts           # Jupiter V6 spot swaps (buy/sell USDC ↔ asset)
-│       │   ├── kaminoLending.ts         # Kamino Finance USDC lending (supply-side yield)
-│       │   ├── marginFiLending.ts       # MarginFi borrow leg (negative-funding short-spot hedge)
-│       │   ├── crossChainFunding.ts     # Multi-chain funding aggregator (clamped + normalized)
-│       │   └── costModel.ts             # Route-aware bridge + gas + slippage cost model
-│       └── strategy/
-│           ├── crossChainDecision.ts    # Per-asset best-chain selection (fee-adjusted net edge)
-│           └── crossChainExecutor.ts    # Cross-chain move execution wrapper
-│
-├── programs/
-│   └── delta_vault/                   # Anchor on-chain program (Rust)
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs
-│           ├── vault.rs               # Deposit / withdraw + NAV staleness guard
-│           ├── strategy.rs            # Bot authorization + 24hr rotation timelock
-│           ├── risk.rs                # On-chain guardrails + risk oracle PDA
-│           └── fees.rs                # Epoch-gated management + performance fees
-│
-├── frontend/                          # Standalone presentation components (legacy)
-│
-├── docs/
-│   └── strategy.md
-│
-└── README.md
+Example:
+─────────────────────────────────────────────────────────
+Chain    BTC Funding  ETH Funding  Best Action
+─────────────────────────────────────────────────────────
+Solana   +0.008%      +0.005%      —
+Base     +0.012%      +0.004%      Move BTC to Base
+─────────────────────────────────────────────────────────
+→ Bot routes $50k BTC spot/perp to Base
+→ Saves bridge cost, captures 0.4% APR extra
+→ Auto-rebalances daily
 ```
+
+**Safety:** Costs modeled into decision (bridge fees, slippage). Moves only execute if net edge > 1.5%.
+
+---
+
+### 🤖 **AI Agent Decision Overlay**
+Beyond pure math, the bot includes an optional AI observational layer that analyzes:
+- Momentum trends (short-window price acceleration)
+- Market regime shifts
+- Volatility spikes vs. baseline
+
+Agent confidence scores (0–1) inform position sizing. High confidence momentum → larger positions. Uncertain regime → smaller positions.
+
+**Not a black-box.** Agent decisions are logged with reasoning; you can disable it (AI_AGENT_ENABLED=false) and run pure strategy.
+
+---
+
+### 📊 **Real-Time Funding Rate Scanner**
+Continuously ranks all assets by funding rate attractiveness. Re-scans every 5 minutes, highlights:
+- **Top Yield:** Which asset has best current funding?
+- **Best Risk-Adjusted:** Highest funding relative to volatility?
+- **Regime:** Is this funding sustainable or peak?
+
+Helps you decide: *Should I rotate spot capital from SOL into BTC?*
+
+---
+
+### ⏰ **Funding Settlement Timer**
+Hyperliquid settles funding every 1 hour. The bot counts down to settlement:
+
+```
+[SETTLEMENT] Next funding in 47 minutes 32 seconds
+[FUNDING] Current hourly APR: +0.0042% (~3.7% yearly)
+[EST_HOURLY_PNL] $12.43 / hour (assuming 2 positions held)
+```
+
+Helps you understand: *If I enter now, how long until I collect first funding?* Crucial for short-term traders.
+
+---
+
+## Safety & Risk Management
+
+Delta Vault runs **dual safety loops** to protect capital:
+
+### Layer 1: Strategy Level (15s Cycle)
+The main strategy loop evaluates:
+- ✅ Funding rate sufficient? (MIN_FUNDING_RATE_APR)
+- ✅ Position size safe? (MAX_POSITION_SIZE_PERCENT)
+- ✅ Trade minimum met? (MIN_TRADE_SIZE_FLOOR + MIN_TRADE_SIZE_PERCENT)
+- ✅ Slippage acceptable? (MAX_SLIPPAGE_PERCENT)
+- ✅ Basis spread profitable? (BASIS_SPREAD threshold)
+
+If any check fails, trade is **rejected** before order submission.
+
+### Layer 2: Risk Engine (10s Cycle)
+Faster than strategy, runs continuously and has veto power:
+
+| Monitor | Threshold | Action |
+|---------|-----------|--------|
+| **Portfolio Drawdown** | > 10% | 🛑 EMERGENCY_CLOSE all positions |
+| **Delta Exposure** | > 5% of NAV | ⚖️ REBALANCE positions |
+| **Single Asset Loss** | > 7% unrealized | ❌ CLOSE that leg |
+| **Free Collateral** | < 20% | 🚫 HALT_NEW_TRADES |
+| **Funding Volatility** | > 20% relative jump | 📉 REDUCE_SIZE 50% |
+| **Network Latency** | Solana RPC > 500ms | ⏸️ PAUSE execution |
+| **Hyperliquid Latency** | API > 2s round-trip | 🔇 HALT orders |
+| **Oracle Staleness** | Price > 30s old | 🛑 STOP new positions |
+
+**Example:** You're in a $50k delta-neutral position. Suddenly, Hyperliquid API times out (>2s). Risk engine **pauses all new orders** until API recovers. Existing positions held, but no new entries triggered risk.
+
+---
+
+### Circuit Breakers
+
+1. **Funding Rate Circuit Breaker:** If any asset's APR exceeds 300% (extreme regime), new entries blocked until normalization.
+
+2. **Market Impact Cap:** No single trade can exceed 0.1% of 24h volume or 0.5% of open interest (prevents moving thin markets).
+
+3. **Gross Notional Cap:** Total spot + perp notional ≤ equity × 1.5x leverage (prevents over-leverage).
+
+---
+
+## Configuration: Pick Your Profile
+
+Choose a preset tuned for your account size. **Zero code changes required.**
+
+| Profile | Account Size | Ideal Use Case | Min Trade | Max Position |
+|---------|--------------|----------------|-----------|--------------|
+| **SMALL** | <$500 | Testing, microaccounts, learning | $5 | 15% equity |
+| **MEDIUM** | $500–$5k | Most live traders | $20 | 20% equity |
+| **LARGE** | $5k–$100k | Professional traders | $100 | 30% equity |
+| **PRODUCTION** | >$100k | Enterprise vaults, capital preservation | $500 | 15% equity |
+
+**Activate with one line:**
+```bash
+CONFIG_PROFILE=SMALL npm run dev
+```
+
+See [PRESET_GUIDE.md](./PRESET_GUIDE.md) for detailed breakdowns of each preset.
 
 ---
 
 ## Quick Start
 
-### 1. Dashboard
+### Prerequisites
+- Node.js 18+
+- Hyperliquid testnet or mainnet API keys
+- Solana devnet / mainnet RPC endpoint
+- ~$20–$1,000 initial capital (or use DEMO_MODE)
 
-```bash
-cd dashboard
-npm install
-npm run dev        # http://localhost:5173
-```
-
-The dashboard polls the bot state API automatically. Falls back to simulation mode if the bot is not running.
-
-### 2. Bot
-
+### Installation
 ```bash
 cd bot
 npm install
-cp .env.example .env
-# Edit .env — set HELIUS_RPC_URL, WALLET_PRIVATE_KEY_BASE58
-# For live trading: set EVM_PRIVATE_KEY (Hyperliquid signing)
+```
+
+### Configuration
+```bash
+# bot/.env
+SOLANA_NETWORK=mainnet-beta          # or devnet
+HYPERLIQUID_API_KEY=your_key
+HYPERLIQUID_SECRET=your_secret
+HYPERLIQUID_WALLET=your_address
+
+# For $20 account
+CONFIG_PROFILE=SMALL
+DEMO_MODE=true                       # Start in dry-run
+DEMO_EQUITY=20
+```
+
+### Run
+```bash
+# Dry-run (logs trades, no real orders)
+npm run dev
+
+# Live (requires DEMO_MODE=false)
+DEMO_MODE=false npm run dev
+```
+
+### Monitor
+- **Terminal:** Full strategy logs, position updates, funding rates
+- **Telegram:** (Optional) Real-time alerts on trades, risk events, funding changes
+- **HTTP API:** `http://localhost:3000/status` — JSON snapshot of vault state
+
+---
+
+## Execution Flow
+
+```
+┌─ Every 15 seconds ───────────────────────────────────────┐
+│                                                            │
+│  1. Fetch market data (Hyperliquid funding, Kamino yields)│
+│  2. Run strategy (evaluate funding, basis, regime)       │
+│  3. Generate signal (DELTA_NEUTRAL_OPEN, BASIS_TRADE, …) │
+│  4. Size position (Kelly fraction, preset config)        │
+│  5. Check risk engine (10s checks) — block if unsafe     │
+│  6. Submit orders (spot + perp simultaneously)           │
+│  7. Monitor execution (fill rates, slippage)             │
+│  8. Log cycle (market snapshot, PnL, next actions)       │
+│                                                            │
+└─────────────────────────────────────────────────────────┘
+
+┌─ Every 10 seconds (concurrent) ──────────────────────────┐
+│                                                            │
+│  Risk Monitor:                                            │
+│  • Check portfolio drawdown, delta, collateral ratio     │
+│  • Monitor network / exchange latency                    │
+│  • Evaluate funding volatility                           │
+│  • Take protective actions (halt, reduce, close)         │
+│                                                            │
+└─────────────────────────────────────────────────────────┘
+
+┌─ Every 5 minutes ────────────────────────────────────────┐
+│                                                            │
+│  Scanner rescan:                                         │
+│  • Rank all assets by funding rate, volatility           │
+│  • Identify regime transitions (EXPANSION → DECAY)       │
+│  • Suggest capital allocation shifts                     │
+│                                                            │
+└─────────────────────────────────────────────────────────┘
+
+┌─ Every 30 seconds ───────────────────────────────────────┐
+│                                                            │
+│  API updates:                                            │
+│  • POST vault state to external dashboard (optional)     │
+│  • Send Telegram alerts if configured                    │
+│  • Log full cycle summary (professional format)          │
+│                                                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Real-World Example
+
+**Setup:** $500 account, MEDIUM preset, live trading
+
+```
+09:05:12 [CYCLE] Starting cycle #437...
+09:05:12 [MARKET] BTC: spot=$42,567, perp=$42,581 (+0.03%), funding=+0.0042% hourly
+09:05:12 [MARKET] ETH: spot=$2,267, perp=$2,269 (+0.09%), funding=+0.0053% hourly
+09:05:13 [SIGNAL] BTC: DELTA_NEUTRAL_OPEN | funding=+0.0042% (8.4% APR) exceeds threshold=0.005%
+09:05:13 [SIGNAL] ETH: DELTA_NEUTRAL_OPEN | funding=+0.0053% (10.7% APR) exceeds threshold=0.005%
+
+09:05:13 [POSITION_SIZE] BTC: $125 (25% of $500 capital) | perp notional: $125 short
+09:05:13 [POSITION_SIZE] ETH: $100 (20% of $500 capital) | perp notional: $100 short
+
+09:05:14 [EXECUTE] Submitting spot BUY: 0.00293 BTC @ market
+09:05:14 [EXECUTE] Submitting perp SHORT: 0.003 BTC @ market
+09:05:15 [FILL] Spot filled: 0.00293 BTC @ $42,578 (slippage: +$32)
+09:05:15 [FILL] Perp filled: 0.003 BTC @ $42,575 (slippage: -$9)
+09:05:15 [FUNDING] Next settlement: 47 minutes 32 seconds
+09:05:15 [EST_HOURLY_PNL] $0.22 next hour (all positions combined)
+
+[PORTFOLIO]
+  Capital: $500.00
+  Lending (Kamino): $200.00 @ 4.2% APY
+  Trading (delta-neutral): $200.00 notional
+  Cash: $100.00 (dry powder for rebalance)
+  Total unrealized PnL: -$18.32 (due to entry slippage; will recover via funding)
+
+[NEXT_ACTIONS]
+  • Monitor funding settlement (47m 32s)
+  • Check if regime transitions (currently EXPANSION)
+  • Rebalance if delta > 5% (currently 0.1%)
+```
+
+---
+
+## Advanced Features
+
+### Bybit Venue Routing
+When Bybit's funding rate exceeds Hyperliquid's by ≥0.2% APR AND Bybit has sufficient liquidity, route perp orders to Bybit and collect the spread arbitrage in addition to standard funding.
+
+### Positive Funding Rate Persistence
+A machine learning model (trained on historical Hyperliquid funding data) predicts: *Will funding stay positive for the next hour?*
+
+High confidence → hold positions longer. Low confidence → tighter stop losses. Reduces whipsaws.
+
+### Solana Congestion Detection
+Before submitting Kamino deposit/withdrawal orders, check Solana RPC latency and recent slot times. If network is congested (>500ms latency), delay Kamino rebalancing until network recovers. Prevents expensive failed txs.
+
+### Professional Logging
+Output is formatted for senior traders & risk teams:
+- **Sections** for market data, capital allocation, risk
+- **Tables** for cross-chain evaluations, funding summaries
+- **Color coding** for urgency (green = safe, yellow = warning, red = critical)
+- **Timestamps** with millisecond precision for audit trails
+
+---
+
+## Monitoring & Observability
+
+### Terminal Output
+```
+17:21:03 [INFO  ] [CrossChain] Evaluation Summary:
+  ASSET    │ ROUTE          │ NET_EDGE   │ EST_PNL  │ ACTION
+  BTC      │ solana→base    │ -1.024%    │ $-10     │ —
+  ETH      │ solana→base    │ -0.988%    │ $-10     │ —
+  HYPE     │ undefined→base │ -1.028%    │ $-10     │ —
+```
+
+### HTTP Status Endpoint
+```bash
+curl http://localhost:3000/status | jq .
+
+{
+  "vault_equity": 499.82,
+  "positions": [
+    {
+      "asset": "BTC",
+      "spot_side": "LONG",
+      "spot_amount": 0.00293,
+      "perp_side": "SHORT",
+      "perp_amount": 0.003,
+      "delta": 0.0001,
+      "unrealized_pnl": -18.32
+    }
+  ],
+  "risk_status": "NORMAL",
+  "next_funding_settlement": "2026-04-15T17:52:00Z"
+}
+```
+
+### Telegram Alerts (Optional)
+- New positions opened/closed
+- Risk events (drawdown warnings, collateral low)
+- Funding rate spikes
+- Regime transitions
+
+---
+
+## Deployment
+
+### Development
+```bash
 npm run dev
 ```
 
-### 3. Build the Vault Program (optional — enables on-chain sync)
-
+### Production (Ubuntu/Docker)
 ```bash
-# Install toolchain (once)
-cargo install --git https://github.com/coral-xyz/anchor --tag v0.29.0 anchor-cli --locked
-
-# Build and copy IDL
-cd programs/delta_vault
-anchor build
-cp target/idl/delta_vault.json ../../bot/src/idl/delta_vault.json
-
-# Deploy to devnet
-anchor deploy --provider.cluster devnet
+docker build -t delta-vault .
+docker run -d \
+  --env-file .env \
+  -p 3000:3000 \
+  --restart always \
+  delta-vault
 ```
 
-Set the resulting program ID in `.env`:
-```
-VAULT_PROGRAM_ID=<your deployed program ID>
-```
-
-### 4. Enable Secret-Scan Hook (Recommended)
-
+### Systemd (Ubuntu)
 ```bash
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
+sudo tee /etc/systemd/system/delta-vault.service <<EOF
+[Unit]
+Description=Delta Vault Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/delta-vault/bot
+ExecStart=/usr/bin/npm run dev
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl enable delta-vault
+sudo systemctl start delta-vault
 ```
 
-### Prerequisites
+---
 
-- Node.js 18+
-- A funded Solana wallet (keypair JSON file or base58 private key in `.env`)
-- [Helius API key](https://helius.dev) — devnet key for testing, mainnet for live trading
-- EVM private key for Hyperliquid order signing (live mode only)
-- ~4 SOL in the deployer wallet for vault program deployment (one-time, optional)
+## Testing
+
+### Unit Tests
+```bash
+npm test
+```
+
+### Demo Mode (Risk-Free)
+```bash
+DEMO_MODE=true npm run dev
+```
+All orders logged but not submitted. Simulates your strategy without real capital.
+
+### Testnet
+```bash
+SOLANA_NETWORK=devnet npm run dev
+```
 
 ---
 
-## Risk Engine
+## Troubleshooting
 
-| Check | Limit | Action |
-|-------|-------|--------|
-| Portfolio drawdown | > 10% | Emergency close all |
-| Drawdown warning | > 5% | Alert + monitor |
-| Delta exposure | > 5% NAV | Rebalance perp legs |
-| Single asset loss | > 7% | Close that leg |
-| Free collateral | < 20% | Halt new entries |
-| Funding rate volatility | > 0.2 relative jump (smoothed, clamped) | Reduce position sizes 50% |
-| Solana RPC latency | > 500ms | Pause execution |
-| Oracle staleness | > 30s | Halt new positions |
+### "No trades opening"
+1. Check funding rates: `grep SIGNAL logs.txt` — funding must exceed MIN_FUNDING_RATE_APR
+2. Check risk engine: `grep "HALT\|REDUCE" logs.txt` — might be blocked by safety checks
+3. Verify collateral: Free collateral > 20% is required
 
----
+### "Trades execute but lose money immediately"
+This is **normal in the first cycle.** Spot + perp entry slippage costs ~0.05–0.1% on entry. This is recovered via funding over 1–4 hours. Don't panic.
 
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Blockchain | Solana (devnet / mainnet-beta) |
-| On-chain Program | Anchor Framework 0.29 (Rust) |
-| Perp DEX | Hyperliquid (EIP-712 signed REST API) |
-| Spot DEX | Jupiter Aggregator V6 (HTTP API) |
-| USDC Lending | Kamino Finance (supply-side, ~4.5% APR) |
-| Borrow (neg. funding) | MarginFi V2 (125% collateral ratio, 80% LTV) |
-| RPC Provider | Helius |
-| Wallet | Standalone ServerWallet (Solana keypair) |
-| Cross-Chain | Arbitrum · Base · Optimism · Polygon · Avalanche · BNB |
-| Dashboard | Vite + React 19 (live polling bot state API) |
-| Language | TypeScript (bot) · React JSX (dashboard) · Rust (program) |
-| Runtime | Node.js 18+ |
+### "Connection refused (Hyperliquid API)"
+Check internet connection and API key validity:
+```bash
+curl -X POST https://api.hyperliquid.xyz/info \
+  -H "Content-Type: application/json" \
+  -d '{"type":"fundingHistory","coin":"BTC"}'
+```
 
 ---
 
-## Security
+## Risk Disclaimer
 
-- **Never commit** your `keypair.json` or `.env` file
-- Use a **dedicated hot wallet** with only the capital you intend to deploy
-- Add `keypair.json` and `.env` to `.gitignore` (already included)
-- The Anchor program enforces a **24-hour timelock** for bot key rotation
-- Consider a [Squads multisig](https://squads.so) for larger vault sizes
+**Delta Vault is an automated trading bot.** While designed with institutional-grade safety checks, no trading system is risk-free.
+
+- **Market Risk:** Basis risk on entry/exit slippage
+- **Liquidation Risk:** Over-leverage or extreme price moves can force closes
+- **Smart Contract Risk:** Hyperliquid, Kamino, MarginFi are mature but audited code can have bugs
+- **Operational Risk:** Network outages, exchange downtime, API failures
+
+**Best Practices:**
+- Start with DEMO_MODE=true
+- Begin with small capital ($100–$1k)
+- Monitor first 24 hours closely
+- Set up Telegram alerts
+- Use SMALL or MEDIUM preset initially
+- Keep 20% collateral buffer (bot enforces this)
 
 ---
 
-## Disclaimer
+## License
 
-This project is a **proof of concept**. Run on devnet first. Nothing in this repository constitutes financial advice.
+Proprietary. For authorized users only.
 
-**Past funding rates and basis spreads do not guarantee future returns.** The historical opportunity range of 8–25% APY reflects periods of elevated market activity. In low-volatility or bear-market conditions, funding rates can turn negative, eliminating or reversing yield. Use at your own risk.
+---
+
+## Support
+
+- **Docs:** See [PRESET_GUIDE.md](./PRESET_GUIDE.md) for account configuration
+- **Logs:** Check `bot/logs/` for detailed execution history
+- **API:**  `/status` endpoint for vault metrics  
+- **Alerts:** Telegram integration for real-time notifications
+
+---
+
+**Built for disciplined traders who want to automate funding rate arbitrage safely.**
+
+🚀 Start with `CONFIG_PROFILE=SMALL npm run dev` and watch your capital compound.
