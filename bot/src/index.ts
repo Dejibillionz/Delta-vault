@@ -71,7 +71,13 @@ const CYCLE_MS      = 15_000;  // 15s strategy loop
 const LOG_EVERY_N   = 2;       // log/API-update every Nth cycle (~30s at 15s)
 const RISK_CYCLE_MS = 10_000;
 let vaultEquity     = parseFloat(process.env.DEMO_EQUITY ?? "10000"); // from HL or sim
-let MIN_TRADE_SIZE  = 100;
+
+// ─── Minimum Trade Size Configuration ────────────────────────────────────────
+// User can adjust MIN_TRADE_SIZE_FLOOR and MIN_TRADE_SIZE_PERCENT in .env
+const MIN_TRADE_SIZE_FLOOR = parseFloat(process.env.MIN_TRADE_SIZE_FLOOR ?? "20");      // Floor: $20 default
+const MIN_TRADE_SIZE_PERCENT = parseFloat(process.env.MIN_TRADE_SIZE_PERCENT ?? "0.01"); // Percentage: 1% default
+let MIN_TRADE_SIZE = MIN_TRADE_SIZE_FLOOR; // Will be recalculated per cycle
+
 const CARRYOVER_DECAY = 0.75;
 const AI_AGENT_ENABLED = process.env.AI_AGENT_ENABLED !== "false";
 const SCANNER_ENABLED  = process.env.SCANNER_ENABLED  !== "false";
@@ -215,9 +221,12 @@ async function main() {
     }
   }
 
-  // Scale MIN_TRADE_SIZE to 5% of equity (floor $200)
-  MIN_TRADE_SIZE = Math.max(200, vaultEquity * 0.05);
-  logger.info(`Vault equity: $${vaultEquity.toFixed(2)}  Min trade: $${MIN_TRADE_SIZE.toFixed(2)}`);
+  // Calculate MIN_TRADE_SIZE from config: max(floor, percentage of equity)
+  MIN_TRADE_SIZE = Math.max(MIN_TRADE_SIZE_FLOOR, vaultEquity * MIN_TRADE_SIZE_PERCENT);
+  logger.info(
+    `Vault equity: $${vaultEquity.toFixed(2)}  Min trade: $${MIN_TRADE_SIZE.toFixed(2)} ` +
+    `(floor: $${MIN_TRADE_SIZE_FLOOR}, ${(MIN_TRADE_SIZE_PERCENT * 100).toFixed(1)}% of equity)`
+  );
 
   const strategyEngine = new StrategyEngine(logger);
   const riskEngine     = new EnhancedRiskEngine(vaultEquity, logger);
