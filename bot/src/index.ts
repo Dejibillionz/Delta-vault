@@ -1687,91 +1687,84 @@ async function main() {
 
       // ── Organized Logging (gated to every LOG_EVERY_N cycles) ─────────────
       if (shouldLog) {
-      logSection(`Cycle #${tick}`);
+      logger.cycleHeader(tick);
 
-      // [MARKET]
-      console.log(`\n${chalk.yellow('[MARKET]')}`);
+      // ─── MARKET DATA ─────────────────────────────────────────────────────
+      console.log(`${chalk.bold(chalk.cyan('┌─ MARKET'))}`);
       for (const a of activeAssets) {
         if (marketData[a]) {
-          console.log(`${a} | $${marketData[a].price.toFixed(2)} | FR ${(marketData[a].fr * 100).toFixed(3)}% | basis ${(marketData[a].basis * 100).toFixed(2)}%`);
+          const price = `$${marketData[a].price.toFixed(0)}`;
+          const fr = `${(marketData[a].fr * 100).toFixed(3)}%`.padStart(8);
+          const basis = `${(marketData[a].basis * 100).toFixed(2)}%`.padStart(7);
+          console.log(`│  ${a.padEnd(6)} ${price.padEnd(12)} FR ${fr}  basis ${basis}`);
         }
       }
 
-      // [STRATEGY]
-      console.log(`\n${chalk.blue('[STRATEGY]')}`);
-      if (strategyData.deltaCapital > 0) {
-        console.log(`Delta Allocation: $${strategyData.deltaCapital.toFixed(2)}`);
-      }
-      if (lockedInPositions > 0) {
-        const openAssets = activeAssets.filter(a => positions.has(`${a}_SPOT`) || positions.has(`${a}_PERP`));
-        console.log(`Open Positions (holding): ${openAssets.join(", ")}  ($${lockedInPositions.toFixed(2)} locked)`);
-      }
-      if (strategyData.lendingCapital > 0) {
-        console.log(`Lending Allocation: $${strategyData.lendingCapital.toFixed(2)}`);
-      }
-
-      // [CAPITAL]
-      console.log(`\n${chalk.white('[CAPITAL]')}`);
-      console.log(`Starting: $${capitalData.starting.toFixed(2)}`);
+      // ─── CAPITAL ALLOCATION ──────────────────────────────────────────────
+      console.log(`${chalk.bold(chalk.cyan('├─ CAPITAL'))}`);
+      logger.row("Starting", `$${capitalData.starting.toFixed(2)}`);
       if (cumulativeLendingYield > 0) {
-        console.log(`Lending Yield Compounded: +$${cumulativeLendingYield.toFixed(4)} → Total Capital: $${totalCapital.toFixed(2)}`);
+        logger.row("Lending Yield", `+$${cumulativeLendingYield.toFixed(4)}`);
       }
-      if (lockedInPositions > 0) {
-        console.log(`Locked In Open Positions: $${lockedInPositions.toFixed(2)}`);
+      if (strategyData.deltaCapital > 0) {
+        logger.row("Reserved (Trades)", `$${capitalData.reservedForTrades.toFixed(2)}`);
       }
-      console.log(`Reserved For Trades: $${capitalData.reservedForTrades.toFixed(2)}`);
-      console.log(`Released From Failed/Skipped: $${capitalData.releasedFromTrades.toFixed(2)}`);
-      console.log(`Remaining Before Lending: $${capitalData.remainingBeforeLending.toFixed(2)}`);
-      console.log(`Lent (Leftover): $${capitalData.lent.toFixed(2)}`);
-      console.log(`Remaining After Lending: $${capitalData.remainingAfterLending.toFixed(2)}`);
-      const carryOverStr = activeAssets.map(a => `${a}: $${(tradeCarryOver[a] ?? 0).toFixed(2)}`).join(" | ");
+      logger.row("Deployed (Lending)", `$${capitalData.lent.toFixed(2)}`);
       const carryTotal = activeAssets.reduce((s, a) => s + (tradeCarryOver[a] ?? 0), 0);
-      console.log(`CarryOver ${carryOverStr} | Total: $${carryTotal.toFixed(2)}`);
+      if (carryTotal > 0) {
+        logger.row("Carryover", `$${carryTotal.toFixed(2)}`);
+      }
 
-      // [EXECUTION]
-      console.log(`\n${chalk.green('[EXECUTION]')}`);
+      // ─── EXECUTION STATUS ────────────────────────────────────────────────
+      console.log(`${chalk.bold(chalk.cyan('├─ EXECUTION'))}`);
       if (executionData.executedTrade) {
-        console.log(`${chalk.green('✔')} Trade(s) executed`);
+        logger.success("Trade(s) executed");
       } else {
-        console.log(`${chalk.gray('•')} No trade executed`);
+        logger.bullet("No trade triggered");
       }
       for (const event of executionData.events) {
-        console.log(`- ${event}`);
+        logger.bullet(event);
       }
 
-      // [RISK]
-      console.log(`\n${chalk.red('[RISK]')}`);
-      console.log(`NAV: $${nav.toFixed(2)}`);
-      console.log(`Drawdown: ${(drawdown * 100).toFixed(2)}%`);
-      console.log(`Delta Exposure: ${(deltaExposure * 100).toFixed(2)}%`);
+      // ─── RISK METRICS ───────────────────────────────────────────────────
+      console.log(`${chalk.bold(chalk.cyan('├─ RISK'))}`);
+      logger.row("NAV", `$${nav.toFixed(2)}`);
+      const drawdownStatus = drawdown > 0.1 ? chalk.red : drawdown > 0.05 ? chalk.yellow : chalk.green;
+      logger.row("Drawdown", drawdownStatus(`${(drawdown * 100).toFixed(2)}%`));
+      logger.row("Delta Exposure", `${(deltaExposure * 100).toFixed(2)}%`);
 
-      // [LENDING]
-      console.log(`\n${chalk.magenta('[LENDING]')}`);
-      if (lendingData.deployed > 0) {
-        console.log(`Deployed: $${lendingData.deployed.toFixed(0)}`);
-        console.log(`Yield (cycle): +$${lendingData.yieldEarned.toFixed(4)}`);
-      }
+      // ─── SETTLEMENT TIMER ────────────────────────────────────────────────
+      const settlementStatus = settlementTimer.getStatusLine();
+      console.log(`${chalk.bold(chalk.cyan('└─ SETTLEMENT'))}`);
+      console.log(`   ${settlementStatus}`);
 
-      // [AI AGENT]
-      if (AI_AGENT_ENABLED) {
-        console.log(`\n${chalk.white('[AI AGENT]')}`);
-        const topFundingEntries = Object.entries(agentObservation.funding)
-          .map(([a, r]) => `${a} FR ${(r * 100).toFixed(3)}%`).slice(0, 4).join(" | ");
-        console.log(`Observation | ${topFundingEntries} | Vol ${agentObservation.volatility.toFixed(3)}`);
-        console.log(`Decision: ${JSON.stringify(agentDecision)}`);
-        console.log(`Max Size: $${agentMaxSize.toFixed(2)}`);
-        console.log(
-          `State | WinRate ${aiAgentState.winRate.toFixed(2)} | ` +
-          `Confidence ${aiAgentState.confidence.toFixed(2)}`
-        );
-      }
-
-      // [SUMMARY]
-      console.log(`\n${chalk.cyan('[SUMMARY]')}`);
+      // ─── PERFORMANCE SUMMARY ────────────────────────────────────────────
       const elapsedHours = (tick * CYCLE_MS) / 3_600_000;
       const projectedApr = elapsedHours > 0 ? (pnl / vaultEquity) * (8760 / elapsedHours) : 0;
-      console.log(`PnL: +$${pnl.toFixed(4)}  [funding: $${openFundingYield.toFixed(4)} | lending: $${cumulativeLendingYield.toFixed(4)} | realized: $${cumulativeRealizedPnl.toFixed(4)}]  Projected APR: ${(projectedApr * 100).toFixed(1)}%  Mode: ${mode}`);
-      console.log(settlementTimer.getStatusLine());
+      console.log(`\n${chalk.bold(chalk.magenta('[SUMMARY]'))}`);
+      logger.row("PnL", `+$${pnl.toFixed(4)}`);
+      logger.row("  ├─ Funding Yield", `+$${openFundingYield.toFixed(4)}`);
+      logger.row("  ├─ Lending Yield", `+$${cumulativeLendingYield.toFixed(4)}`);
+      logger.row("  └─ Realized PnL", `+$${cumulativeRealizedPnl.toFixed(4)}`);
+      const aprColor = projectedApr > 0.20 ? chalk.green : projectedApr > 0.10 ? chalk.yellow : chalk.gray;
+      logger.row("Projected APR", aprColor(`${(projectedApr * 100).toFixed(1)}%`));
+      logger.row("Mode", `${mode}`);
+
+      // AI Agent Summary (if enabled)
+      if (AI_AGENT_ENABLED && agentDecision) {
+        console.log(`\n${chalk.bold(chalk.yellow('[AI AGENT]'))}`);
+        const topFundingEntries = Object.entries(agentObservation.funding)
+          .map(([a, r]) => `${a} ${(r * 100).toFixed(3)}%`).slice(0, 4).join(" | ");
+        logger.row("Observation", topFundingEntries);
+
+        const decisionType = agentDecision.action === "TRADE" ? chalk.green("TRADE") : chalk.gray(agentDecision.action);
+        logger.row("Decision", decisionType);
+
+        if ("confidence" in agentDecision) {
+          logger.row("Confidence", `${(agentDecision.confidence * 100).toFixed(0)}%`);
+        }
+        logger.row("Win Rate", `${aiAgentState.winRate.toFixed(2)}`);
+      }
       } // end if (shouldLog)
 
       // Calculate real PnL from open positions (not simulated)

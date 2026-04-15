@@ -31,7 +31,8 @@ export const THRESHOLDS = {
   MIN_LIQUIDITY_SCORE: IS_MAINNET ? 0.3 : 0.1,
 
   // Maximum position size as fraction of vault (per asset)
-  MAX_POSITION_FRACTION: 0.4,
+  // Reduced from 0.4 (40%) to 0.2 (20%) for safe testing with smaller positions
+  MAX_POSITION_FRACTION: 0.2,
 } as const;
 
 export type SignalType =
