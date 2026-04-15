@@ -1765,6 +1765,25 @@ async function main() {
         }
         logger.row("Win Rate", `${aiAgentState.winRate.toFixed(2)}`);
       }
+
+      // Cross-Chain Summary
+      console.log(`\n${chalk.bold(chalk.cyan('[CROSS-CHAIN]'))}`);
+      let hasCrossChainData = false;
+      for (const asset of activeAssets) {
+        const ccDecision = latestCrossChainDecisions[asset];
+        if (ccDecision) {
+          hasCrossChainData = true;
+          const from = ccDecision.currentChain ?? "undefined";
+          const to = ccDecision.bestChain ?? from;
+          const edge = ((ccDecision.netEdge ?? 0) * 100).toFixed(2);
+          const edgeColor = parseFloat(edge) > 0 ? chalk.green : chalk.red;
+          const status = ccDecision.execute ? chalk.green("MOVE") : "stay";
+          logger.row(`${asset.padEnd(6)}`, `${from} → ${to}  ${edgeColor(`edge ${edge}%`)}  ${status}`);
+        }
+      }
+      if (!hasCrossChainData) {
+        logger.row("Status", "Evaluating...");
+      }
       } // end if (shouldLog)
 
       // Calculate real PnL from open positions (not simulated)
