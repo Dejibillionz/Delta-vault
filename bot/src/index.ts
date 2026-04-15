@@ -15,6 +15,11 @@ import * as http from "http";
 dotenv.config({ path: path.join(__dirname, "../../bot/.env") });
 dotenv.config();
 
+// Load config preset (SMALL, MEDIUM, LARGE, PRODUCTION)
+import { loadPreset, applyPreset } from "./presets";
+const presetSettings = loadPreset();
+applyPreset(presetSettings);
+
 import { Connection } from "@solana/web3.js";
 import chalk from "chalk";
 
