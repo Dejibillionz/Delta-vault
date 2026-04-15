@@ -934,6 +934,8 @@ async function main() {
         try {
           const funding = await getCrossChainFunding(hlExecutor, logger, cexRates, activeAssets);
           latestFundingByChain = funding;
+          const ccTable: Array<[string, string, string, string, string]> = [];
+
           for (const asset of activeAssets) {
             const decision = evaluateCrossChain({
               asset: asset as any,
@@ -944,13 +946,14 @@ async function main() {
               logger,
             });
 
-            logger.info(
-              `Cross-chain decision (${asset}): ${decision.reason} | ` +
-              `from=${decision.currentChain} to=${decision.bestChain ?? decision.currentChain} | ` +
-              `edge=${((decision.netEdge ?? 0) * 100).toFixed(4)}% | ` +
-              `estProfit=$${(decision.expectedProfitUsd ?? 0).toFixed(2)}`
-            );
             latestCrossChainDecisions[asset] = decision;
+
+            // Build table row
+            const route = `${decision.currentChain || "?"}→${decision.bestChain || decision.currentChain}`;
+            const edge = `${((decision.netEdge ?? 0) * 100).toFixed(3)}%`;
+            const pnl = `$${(decision.expectedProfitUsd ?? 0).toFixed(0)}`;
+            const status = decision.execute ? "✓ MOVE" : "—";
+            ccTable.push([asset, route, edge, pnl, status]);
 
             if (decision.execute) {
               const result = await executeCrossChain({
@@ -964,11 +967,17 @@ async function main() {
               if (result.success) {
                 currentChains[asset] = decision.bestChain!;
                 lastCrossChainTimes[asset] = Date.now();
-                logger.info(`Cross-chain move completed (${asset}): ${currentChains[asset]}`);
               } else {
                 logger.error(`Cross-chain move failed (${asset})`);
               }
             }
+          }
+
+          // Log cross-chain table
+          if (ccTable.length > 0) {
+            logger.info("[CrossChain] Evaluation Summary:");
+            logger.tableRow("ASSET", "ROUTE", "NET_EDGE", "EST_PNL", "ACTION");
+            ccTable.forEach(row => logger.tableRow(...row));
           }
         } catch (err: any) {
           logger.error(`Cross-chain eval error: ${err.message}`);

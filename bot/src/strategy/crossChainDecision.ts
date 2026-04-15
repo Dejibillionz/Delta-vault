@@ -100,13 +100,6 @@ export function evaluateCrossChain({
 
   const execute = bestNetEdge > CROSS_CHAIN_CONFIG.MIN_NET_EDGE;
 
-  logger.info(
-    `Cross-chain eval (${asset}): current=${currentChain}, best=${bestChainOverall}, ` +
-    `edgeRawHourly=${((bestRateOverall - currentRate) * 100).toFixed(4)}%, ` +
-    `horizon=${horizon}h, cost=${(bestTotalCostPct * 100).toFixed(4)}%, ` +
-    `net=${(bestNetEdge * 100).toFixed(4)}%, pnl=$${bestExpectedProfitUsd.toFixed(2)}, execute=${execute}`
-  );
-
   return {
     asset,
     execute,
