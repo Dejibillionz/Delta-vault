@@ -1,71 +1,42 @@
-import React, { createContext, useState, useCallback, useEffect } from "react";
-import {
-  MarketTick,
-  PriceData,
-  FundingData,
-  BasisData,
-  LiquidityData,
-  ConfidenceData,
-} from "../types";
+import React, { createContext, useState } from "react";
 
-export interface MarketDataContextType {
-  prices: PriceData;
-  setPrices: (prices: PriceData) => void;
-  funding: FundingData;
-  setFunding: (funding: FundingData) => void;
-  basis: BasisData;
-  setBasis: (basis: BasisData) => void;
-  liquidity: LiquidityData;
-  setLiquidity: (liquidity: LiquidityData) => void;
-  conf: ConfidenceData;
-  setConf: (conf: ConfidenceData) => void;
-  pythOn: boolean;
-  setPythOn: (on: boolean) => void;
-  pythTime: string | null;
-  setPythTime: (time: string | null) => void;
-}
+export const MarketDataContext = createContext(undefined);
 
-export const MarketDataContext = createContext<MarketDataContextType | undefined>(
-  undefined
-);
-
-export const MarketDataProvider: React.FC<{ children: React.ReactNode }> = ({
-  children,
-}) => {
-  const [prices, setPrices] = useState<PriceData>({
+export const MarketDataProvider = ({ children }) => {
+  const [prices, setPrices] = useState({
     BTC: 68450,
     ETH: 3515,
     SOL: 148,
     JTO: 3.2,
   });
-  const [funding, setFunding] = useState<FundingData>({
+  const [funding, setFunding] = useState({
     BTC: 0.000135,
     ETH: 0.000092,
     SOL: 0.00018,
     JTO: 0.000245,
   });
-  const [basis, setBasis] = useState<BasisData>({
+  const [basis, setBasis] = useState({
     BTC: 0.0074,
     ETH: 0.0058,
     SOL: 0.0045,
     JTO: 0.0062,
   });
-  const [liquidity, setLiquidity] = useState<LiquidityData>({
+  const [liquidity, setLiquidity] = useState({
     BTC: 12.4e6,
     ETH: 6.1e6,
     SOL: 4.2e6,
     JTO: 1.1e6,
   });
-  const [conf, setConf] = useState<ConfidenceData>({
+  const [conf, setConf] = useState({
     BTC: 0,
     ETH: 0,
     SOL: 0,
     JTO: 0,
   });
   const [pythOn, setPythOn] = useState(false);
-  const [pythTime, setPythTime] = useState<string | null>(null);
+  const [pythTime, setPythTime] = useState(null);
 
-  const value: MarketDataContextType = {
+  const value = {
     prices,
     setPrices,
     funding,

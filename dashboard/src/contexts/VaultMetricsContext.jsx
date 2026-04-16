@@ -1,35 +1,9 @@
 import React, { createContext, useState } from "react";
-import { VaultMetrics, PnLBreakdown, Position } from "../types";
 
-export interface VaultMetricsContextType {
-  vault: VaultMetrics;
-  setVault: (vault: VaultMetrics) => void;
-  positions: Position[];
-  setPositions: (positions: Position[]) => void;
-  pnlBreakdown: PnLBreakdown;
-  setPnlBreakdown: (breakdown: PnLBreakdown) => void;
-  historyPnl: number[];
-  setHistoryPnl: (history: number[]) => void;
-  historyBtc: number[];
-  setHistoryBtc: (history: number[]) => void;
-  historyEth: number[];
-  setHistoryEth: (history: number[]) => void;
-  historySol: number[];
-  setHistorySol: (history: number[]) => void;
-  historyJto: number[];
-  setHistoryJto: (history: number[]) => void;
-  historyDrawdown: number[];
-  setHistoryDrawdown: (history: number[]) => void;
-}
+export const VaultMetricsContext = createContext(undefined);
 
-export const VaultMetricsContext = createContext<VaultMetricsContextType | undefined>(
-  undefined
-);
-
-export const VaultMetricsProvider: React.FC<{ children: React.ReactNode }> = ({
-  children,
-}) => {
-  const [vault, setVault] = useState<VaultMetrics>({
+export const VaultMetricsProvider = ({ children }) => {
+  const [vault, setVault] = useState({
     nav: 0,
     pnl: 0,
     drawdown: 0,
@@ -38,22 +12,20 @@ export const VaultMetricsProvider: React.FC<{ children: React.ReactNode }> = ({
     totalUnrealizedPnl: 0,
     equityTarget: 0,
   });
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [pnlBreakdown, setPnlBreakdown] = useState<PnLBreakdown>({
+  const [positions, setPositions] = useState([]);
+  const [pnlBreakdown, setPnlBreakdown] = useState({
     funding: 0,
     lending: 0,
     realized: 0,
   });
-  const [historyPnl, setHistoryPnl] = useState<number[]>(Array(50).fill(0));
-  const [historyBtc, setHistoryBtc] = useState<number[]>(Array(50).fill(68450));
-  const [historyEth, setHistoryEth] = useState<number[]>(Array(50).fill(3515));
-  const [historySol, setHistorySol] = useState<number[]>(Array(50).fill(148));
-  const [historyJto, setHistoryJto] = useState<number[]>(Array(50).fill(3.2));
-  const [historyDrawdown, setHistoryDrawdown] = useState<number[]>(
-    Array(50).fill(0)
-  );
+  const [historyPnl, setHistoryPnl] = useState(Array(50).fill(0));
+  const [historyBtc, setHistoryBtc] = useState(Array(50).fill(68450));
+  const [historyEth, setHistoryEth] = useState(Array(50).fill(3515));
+  const [historySol, setHistorySol] = useState(Array(50).fill(148));
+  const [historyJto, setHistoryJto] = useState(Array(50).fill(3.2));
+  const [historyDrawdown, setHistoryDrawdown] = useState(Array(50).fill(0));
 
-  const value: VaultMetricsContextType = {
+  const value = {
     vault,
     setVault,
     positions,

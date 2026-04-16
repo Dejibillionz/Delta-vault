@@ -1,35 +1,14 @@
 import React, { createContext, useState } from "react";
-import { LogEntry, RiskEvent, DvModal } from "../types";
 
-export interface UIContextType {
-  running: boolean;
-  setRunning: (running: boolean) => void;
-  tab: "dashboard" | "architecture" | "how";
-  setTab: (tab: "dashboard" | "architecture" | "how") => void;
-  logs: LogEntry[];
-  setLogs: (logs: LogEntry[]) => void;
-  addLog: (type: string, msg: string) => void;
-  riskFlags: RiskEvent[];
-  setRiskFlags: (flags: RiskEvent[]) => void;
-  tick: number;
-  setTick: (tick: number) => void;
-  dvModal: DvModal;
-  setDvModal: (modal: DvModal) => void;
-}
+export const UIContext = createContext(undefined);
 
-export const UIContext = createContext<UIContextType | undefined>(undefined);
-
-export const UIProvider: React.FC<{ children: React.ReactNode }> = ({
-  children,
-}) => {
+export const UIProvider = ({ children }) => {
   const [running, setRunning] = useState(true);
-  const [tab, setTab] = useState<"dashboard" | "architecture" | "how">(
-    "dashboard"
-  );
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [riskFlags, setRiskFlags] = useState<RiskEvent[]>([]);
+  const [tab, setTab] = useState("dashboard");
+  const [logs, setLogs] = useState([]);
+  const [riskFlags, setRiskFlags] = useState([]);
   const [tick, setTick] = useState(0);
-  const [dvModal, setDvModal] = useState<DvModal>({
+  const [dvModal, setDvModal] = useState({
     open: false,
     tab: "deposit",
     amount: "",
@@ -38,20 +17,20 @@ export const UIProvider: React.FC<{ children: React.ReactNode }> = ({
     error: "",
   });
 
-  const addLog = (type: string, msg: string) => {
+  const addLog = (type, msg) => {
     const now = new Date().toTimeString().slice(0, 8);
     setLogs((prev) => [
       ...prev.slice(-200),
       {
         id: Math.random(),
-        type: type as any,
+        type,
         msg,
         time: now,
       },
     ]);
   };
 
-  const value: UIContextType = {
+  const value = {
     running,
     setRunning,
     tab,

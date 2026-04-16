@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Card, Spark, PnLChart, Gauge, Log, Pill, SectionHead } from "./components/primitives";
+import { AppProviders } from "./components/AppProviders";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    DELTA VAULT — Full Presentation Build
@@ -159,9 +160,9 @@ async function fetchPyth() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MAIN APP
+// MAIN APP (internal dashboard component)
 // ═══════════════════════════════════════════════════════════════════════════════
-export default function DeltaVault() {
+function DeltaVaultDashboard() {
   // ── State ──────────────────────────────────────────────────────────────────
   const [running,    setRunning]    = useState(true); // Auto-start simulation
   const [tab,        setTab]        = useState("dashboard"); // dashboard | architecture | how
@@ -1706,5 +1707,14 @@ export default function DeltaVault() {
         </div>
       )}
     </div>
+  );
+}
+
+// Wrap with context providers
+export default function DeltaVault() {
+  return (
+    <AppProviders>
+      <DeltaVaultDashboard />
+    </AppProviders>
   );
 }
