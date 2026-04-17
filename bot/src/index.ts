@@ -1,10 +1,12 @@
 /**
  * Delta Vault Bot — Main Orchestrator
- * Solana / Hyperliquid + Kamino / BTC + ETH + SOL + JTO
+ * Solana / Hyperliquid + Kamino / Configurable assets (set TRADING_ASSETS env var)
+ * Default: BTC, ETH, SOL, JTO (can be overridden)
  *
  * Usage:
  *   DEMO_MODE=true npm run dev   ← logs everything, no real orders
  *   DEMO_MODE=false npm run dev  ← live trading on configured network
+ *   TRADING_ASSETS=BTC,MATIC npm run dev ← custom asset list
  */
 
 import * as dotenv from "dotenv";
