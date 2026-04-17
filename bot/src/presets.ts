@@ -15,6 +15,41 @@ export interface ConfigPreset {
 }
 
 export const PRESETS: Record<string, ConfigPreset> = {
+  // ─── MICRO ACCOUNT: $20-$100 ───────────────────────────────────────────
+  MICRO: {
+    name: "MICRO",
+    description: "Optimized for micro accounts $20-$100 (minimal position sizing, high APR threshold)",
+    settings: {
+      // Position Sizing
+      MIN_TRADE_SIZE_FLOOR: 1,
+      MIN_TRADE_SIZE_PERCENT: 0.10, // 10% of equity
+
+      // Risk Management
+      MAX_DRAWDOWN_PERCENT: 0.08, // 8% hard stop
+      MAX_POSITION_SIZE_PERCENT: 0.25, // 25% per trade
+      MAX_DELTA_EXPOSURE: 0.05,
+
+      // Capital Allocation
+      LENDING_ALLOCATION_PERCENT: 0.30, // 30% trading, 70% lending (stability over growth)
+
+      // Trade Entry/Exit
+      MIN_FUNDING_RATE_APR: 0.02, // 2% APR minimum (high quality only)
+      MAX_HOLD_TIME_MINUTES: 120, // 2 hours max hold
+      PROFIT_TARGET_PERCENT: 0.02, // 2% profit exit
+
+      // Slippage
+      MAX_SLIPPAGE_PERCENT: 0.001,
+      ESTIMATED_FEE_PERCENT: 0.005,
+
+      // Disable expensive features
+      CROSS_CHAIN_ENABLED: false,
+
+      // Monitoring
+      LOG_VERBOSITY: "NORMAL",
+      TELEGRAM_ENABLED: true,
+    },
+  },
+
   // ─── SMALL ACCOUNT: $20-$500 ───────────────────────────────────────────
   SMALL: {
     name: "SMALL",
