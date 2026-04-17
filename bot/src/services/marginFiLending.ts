@@ -31,12 +31,25 @@ const MIN_NET_EDGE = 0.02;
 const COLLATERAL_RATIO = 1.25;
 
 // ── Simulated borrow rates (annual, demo) ─────────────────────────────────────
-const SIM_BORROW_RATES: Record<string, number> = {
+// Default rates based on market liquidity; customize via env var or override
+const DEFAULT_BORROW_RATES: Record<string, number> = {
   BTC: 0.02,   // 2%   — deep market, high liquidity
   ETH: 0.03,   // 3%
   SOL: 0.05,   // 5%
   JTO: 0.10,   // 10%  — thin market
 };
+
+// Build simulated rates from trading assets
+function getSimulatedBorrowRates(): Record<string, number> {
+  const TRADING_ASSETS = (process.env.TRADING_ASSETS ?? "BTC,ETH,SOL,JTO").split(",").map(a => a.trim());
+  const rates: Record<string, number> = {};
+  TRADING_ASSETS.forEach(asset => {
+    rates[asset] = DEFAULT_BORROW_RATES[asset] ?? 0.05; // Default to 5% for unknown assets
+  });
+  return rates;
+}
+
+const SIM_BORROW_RATES = getSimulatedBorrowRates();
 
 // ── Interfaces ────────────────────────────────────────────────────────────────
 export interface BorrowRecord {

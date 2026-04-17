@@ -343,18 +343,21 @@ export class HyperliquidExecutor {
   private simulatedFundingRates(): Record<string, number> {
     const base = 0.000125; // ~11%/yr per-hour
     const jitter = (seed: number) => base + (Math.sin(Date.now() / 60_000 + seed) * 0.000030);
-    return {
-      BTC: jitter(1),
-      ETH: jitter(2),
-      SOL: jitter(3),
-      JTO: jitter(4) + 0.000020, // JTO slightly higher
-    };
+    const TRADING_ASSETS = (process.env.TRADING_ASSETS ?? "BTC,ETH,SOL,JTO").split(",").map(a => a.trim());
+
+    const rates: Record<string, number> = {};
+    TRADING_ASSETS.forEach((asset, i) => {
+      rates[asset] = jitter(i + 1) + (asset === "JTO" ? 0.000020 : 0); // JTO slightly higher
+    });
+    return rates;
   }
 
   private simulatedPrice(asset: string): number {
+    // Base prices for demo mode (should approximate current market)
     const prices: Record<string, number> = {
       BTC: 71_000, ETH: 3_800, SOL: 182, JTO: 4.5,
     };
+    // For unknown assets, use a reasonable fallback
     return prices[asset] ?? 100;
   }
 }

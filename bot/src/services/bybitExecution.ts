@@ -17,6 +17,7 @@
 import axios from "axios";
 import * as crypto from "crypto";
 import { Logger } from "../logger";
+import { getDecimals } from "../config/tokenConfig";
 
 const BYBIT_BASE     = "https://api.bybit.com";
 const RECV_WINDOW    = "5000";
@@ -256,16 +257,21 @@ export class BybitExecutor {
   }
 
   getQtyDecimals(asset: string): number {
-    const map: Record<string, number> = {
-      BTC: 3, ETH: 2, SOL: 1, JTO: 0,
-    };
-    return map[asset] ?? 2;
+    // Try to get from centralized token config first
+    const configDecimals = getDecimals(asset);
+    if (configDecimals !== undefined) {
+      return Math.max(0, 8 - configDecimals); // Bybit uses qty precision (e.g., BTC=8 decimals → 3 qty decimals)
+    }
+    // Fallback for unknown assets
+    return 2;
   }
 
   private simulatedPrice(asset: string): number {
+    // Base prices for demo mode (should approximate current market)
     const prices: Record<string, number> = {
       BTC: 71_000, ETH: 3_800, SOL: 182, JTO: 4.5,
     };
+    // For unknown assets, use a reasonable fallback
     return prices[asset] ?? 100;
   }
 }
