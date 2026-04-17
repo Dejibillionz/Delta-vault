@@ -1,15 +1,8 @@
 import React from "react";
-
-const SCOL = {
-  DELTA_NEUTRAL: "#00ffa3",
-  DELTA_NEUTRAL_REVERSE: "#a78bfa",
-  BASIS_TRADE: "#f59e0b",
-  PARK_CAPITAL: "#5ba8d0",
-  NONE: "#3a4e62",
-};
+import { colors } from "../../styles/colors";
 
 export const Pill = React.memo(({ label }) => {
-  const c = SCOL[label] || "#3a4e62";
+  const c = colors.signal[label] || "#3a4e62";
   return (
     <span
       style={{

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Card, Spark, PnLChart, Gauge, Log, Pill, SectionHead } from "./components/primitives";
 import { AppProviders } from "./components/AppProviders";
+import { colors } from "./styles/colors";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    DELTA VAULT — Full Presentation Build
@@ -1055,7 +1056,7 @@ function DeltaVaultDashboard() {
               <SectionHead n="2" label="STRATEGY ENGINE" color="#5ba8d0" />
               <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 10 }}>
                 {ASSETS.map(a => (
-                  <div key={a} className="hov" style={{ padding: "11px 13px", background: "#060911", borderRadius: 8, border: `1px solid ${(SCOL[signals[a]] || "#111e2e")}1a` }}>
+                  <div key={a} className="hov" style={{ padding: "11px 13px", background: "#060911", borderRadius: 8, border: `1px solid ${(colors.signal[signals[a]] || "#111e2e")}1a` }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
                       <div>
                         <span style={{ fontSize: 13, fontWeight: 500, color: "#e8eef8" }}>{a}</span>
