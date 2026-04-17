@@ -10,11 +10,11 @@ import { colors } from "./styles/colors";
 ═══════════════════════════════════════════════════════════════════════════ */
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const ASSETS = ["BTC", "ETH", "SOL", "JTO"];
 const FUNDING_THRESHOLD = 0.0001;   // 0.01%/hr
 const BASIS_THRESHOLD   = 0.01;     // 1%
 const VAULT_INITIAL     = 10000;    // fallback equity for sim mode ($)
 const CROSS_CHAIN_CHAINS = ["solana", "arbitrum", "base", "optimism", "polygon", "avalanche", "bnb"];
+const DEFAULT_ASSETS = ["BTC", "ETH", "SOL", "JTO"]; // fallback if bot API unavailable
 
 const CROSS_CHAIN_CFG = {
   ENABLED: true,
@@ -234,6 +234,9 @@ function DeltaVaultDashboard() {
   // PnL breakdown: funding yield / lending yield / realized
   const [pnlBreakdown, setPnlBreakdown] = useState({ funding: 0, lending: 0, realized: 0 });
 
+  // Dynamically selected assets from bot scanner (fallback to defaults)
+  const [ASSETS, setASSETS] = useState(DEFAULT_ASSETS);
+
   // Logs
   const [logs,      setLogs]      = useState([]);
   const [riskFlags, setRiskFlags] = useState([]);
@@ -300,27 +303,35 @@ function DeltaVaultDashboard() {
         setLiveSync(true);
         setLiveSyncErr("");
 
+        // Extract dynamically selected assets from bot scanner
+        if (d.assets && Array.isArray(d.assets) && d.assets.length > 0) {
+          setASSETS(d.assets);
+        }
+
         if (d.prices.BTC > 0 && d.prices.ETH > 0) {
-          setPrices(p => ({
-            BTC: d.prices.BTC ?? p.BTC,
-            ETH: d.prices.ETH ?? p.ETH,
-            SOL: d.prices.SOL > 0 ? d.prices.SOL : p.SOL,
-            JTO: d.prices.JTO > 0 ? d.prices.JTO : p.JTO,
-          }));
-          setFunding({ BTC: d.funding?.BTC ?? 0, ETH: d.funding?.ETH ?? 0, SOL: d.funding?.SOL ?? 0, JTO: d.funding?.JTO ?? 0 });
-          setBasis({ BTC: d.basis?.BTC ?? 0, ETH: d.basis?.ETH ?? 0, SOL: d.basis?.SOL ?? 0, JTO: d.basis?.JTO ?? 0 });
-          setSignals({
-            BTC: d.signals?.BTC ?? "PARK_CAPITAL",
-            ETH: d.signals?.ETH ?? "PARK_CAPITAL",
-            SOL: d.signals?.SOL ?? "PARK_CAPITAL",
-            JTO: d.signals?.JTO ?? "PARK_CAPITAL",
+          // Dynamically build prices/funding/basis for selected assets
+          const newPrices = {};
+          const newFunding = {};
+          const newBasis = {};
+          const newSignals = {};
+          const newLending = {};
+
+          (d.assets || DEFAULT_ASSETS).forEach(a => {
+            newPrices[a] = d.prices?.[a] ?? 0;
+            newFunding[a] = d.funding?.[a] ?? 0;
+            newBasis[a] = d.basis?.[a] ?? 0;
+            newSignals[a] = d.signals?.[a] ?? "PARK_CAPITAL";
+            newLending[a] = {
+              amount: d.lendingByAsset?.[a]?.amount ?? 0,
+              yield: d.lendingByAsset?.[a]?.yield ?? 0
+            };
           });
-          setLending({
-            BTC: { amount: d.lendingByAsset?.BTC?.amount ?? 0, yield: d.lendingByAsset?.BTC?.yield ?? 0 },
-            ETH: { amount: d.lendingByAsset?.ETH?.amount ?? 0, yield: d.lendingByAsset?.ETH?.yield ?? 0 },
-            SOL: { amount: d.lendingByAsset?.SOL?.amount ?? 0, yield: d.lendingByAsset?.SOL?.yield ?? 0 },
-            JTO: { amount: d.lendingByAsset?.JTO?.amount ?? 0, yield: d.lendingByAsset?.JTO?.yield ?? 0 },
-          });
+
+          setPrices(newPrices);
+          setFunding(newFunding);
+          setBasis(newBasis);
+          setSignals(newSignals);
+          setLending(newLending);
           if (d.pnlBreakdown) {
             setPnlBreakdown(d.pnlBreakdown);
           }
