@@ -25,7 +25,9 @@ export function decide(observation: AgentObservation, state: AgentState): AgentD
   const assets = Object.keys(fundingByAsset);
 
   if (assets.length === 0) {
-    return { action: "SKIP", asset: "BTC", reason: "No assets in observation" };
+    // Fallback to first trading asset from env, or "BTC" if unavailable
+    const defaultAsset = (process.env.TRADING_ASSETS ?? "BTC").split(",")[0].trim();
+    return { action: "SKIP", asset: defaultAsset, reason: "No assets in observation" };
   }
 
   // Update EWMA and momentum scores for each asset (side effect on state)

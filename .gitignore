@@ -1,5 +1,4 @@
 # Environment & secrets — NEVER commit these
-.env
 keypair.json
 *.key
 *.pem
@@ -18,7 +17,6 @@ logs/
 Thumbs.db
 
 # IDE
-.vscode/
 .idea/
 
 # TypeScript
@@ -27,3 +25,7 @@ Thumbs.db
 # Rust / Anchor build artifacts
 target/
 programs/delta_vault/target/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
