@@ -595,8 +595,10 @@ async function main() {
     try {
       const latencyMs   = await measureLatency(connection);
       const hlLatencyMs = await measureHlLatency(hlExecutor);
-      const btcSnap     = marketEngine.getSnapshot("BTC");
-      const oracleAgeS  = btcSnap ? (Date.now() - btcSnap.timestamp) / 1000 : 0;
+      // Use first trading asset for oracle staleness check (primary reference asset)
+      const primaryAsset = TRADING_ASSETS[0] ?? "BTC";
+      const refSnap      = marketEngine.getSnapshot(primaryAsset);
+      const oracleAgeS   = refSnap ? (Date.now() - refSnap.timestamp) / 1000 : 0;
 
       const conditions: MarketConditions = {
         fundingRateVolatility: 0.2,
@@ -766,8 +768,10 @@ async function main() {
         const dd24h = cp24h ? (currentPnl - cp24h.pnl) / Math.max(vaultEquity, 1) : 0;
 
         // Fix #1 — ATR slope: track rolling 4-sample ring to detect rising volatility
-        const btcAtr = marketEngine.getSnapshot("BTC")?.atrPct ?? 0;
-        autoHaltAtrRing.push(btcAtr);
+        // Use first trading asset as primary volatility reference (or BTC as fallback)
+        const atrRefAsset = TRADING_ASSETS[0] ?? "BTC";
+        const atrValue = marketEngine.getSnapshot(atrRefAsset)?.atrPct ?? 0;
+        autoHaltAtrRing.push(atrValue);
         if (autoHaltAtrRing.length > 4) autoHaltAtrRing.shift();
         // positive slope = volatility still rising; block resume even if below threshold
         const atrSlope = autoHaltAtrRing.length >= 4
@@ -911,21 +915,23 @@ async function main() {
     const shouldLog = tick % LOG_EVERY_N === 1;
 
     try {
-      // Push NAV on-chain
-      const btcSnap = marketEngine.getSnapshot("BTC");
-      const ethSnap = marketEngine.getSnapshot("ETH");
-      if (btcSnap && ethSnap) {
+      // Push NAV on-chain using first two trading assets (or BTC/ETH as fallback)
+      const primaryAsset = TRADING_ASSETS[0] ?? "BTC";
+      const secondaryAsset = TRADING_ASSETS[1] ?? "ETH";
+      const primarySnap = marketEngine.getSnapshot(primaryAsset);
+      const secondarySnap = marketEngine.getSnapshot(secondaryAsset);
+      if (primarySnap && secondarySnap) {
         const perpPnl = Array.from(positions.entries())
           .filter(([key]) => key.endsWith("_PERP"))
           .reduce((sum, [, pos]) => sum + (pos.unrealizedPnl ?? 0), 0);
-        const btcSpotPos = positions.get("BTC_SPOT");
-        const ethSpotPos = positions.get("ETH_SPOT");
+        const primarySpotPos = positions.get(`${primaryAsset}_SPOT`);
+        const secondarySpotPos = positions.get(`${secondaryAsset}_SPOT`);
         await anchorClient.updateNav(
-          Math.round(btcSnap.spotPrice * 1_000_000),
-          Math.round(ethSnap.spotPrice * 1_000_000),
+          Math.round(primarySnap.spotPrice * 1_000_000),
+          Math.round(secondarySnap.spotPrice * 1_000_000),
           Math.round(perpPnl * 1_000_000),
-          Math.round((btcSpotPos?.baseAmount ?? 0) * 1_000_000),
-          Math.round((ethSpotPos?.baseAmount ?? 0) * 1_000_000)
+          Math.round((primarySpotPos?.baseAmount ?? 0) * 1_000_000),
+          Math.round((secondarySpotPos?.baseAmount ?? 0) * 1_000_000)
         );
       }
 
@@ -1009,21 +1015,23 @@ async function main() {
               pwSum > 0 ? x.pw / pwSum : 1 / powered.length,
             ]));
 
-            // Dynamic BTC/ETH correlation haircut (replaces static 20%)
-            if (scoreWeightMap.has("BTC") && scoreWeightMap.has("ETH")) {
-              const btcReturns = marketEngine.getPriceReturns("BTC");
-              const ethReturns = marketEngine.getPriceReturns("ETH");
-              const corr    = pearsonCorr(btcReturns, ethReturns);
+            // Dynamic correlation haircut between top two assets (generalized from BTC/ETH only)
+            const firstAsset = [...scoreWeightMap.keys()][0];
+            const secondAsset = [...scoreWeightMap.keys()][1];
+            if (firstAsset && secondAsset) {
+              const firstReturns = marketEngine.getPriceReturns(firstAsset);
+              const secondReturns = marketEngine.getPriceReturns(secondAsset);
+              const corr    = pearsonCorr(firstReturns, secondReturns);
               const haircut = Math.max(0, (corr - 0.80) * 1.5); // 0 at corr≤0.80, 22.5% at corr=0.95
-              const ethW    = scoreWeightMap.get("ETH")! * (1 - haircut);
-              const freed   = scoreWeightMap.get("ETH")! - ethW;
-              scoreWeightMap.set("ETH", ethW);
-              const others   = [...scoreWeightMap.keys()].filter(a => a !== "BTC" && a !== "ETH");
+              const secondW  = scoreWeightMap.get(secondAsset)! * (1 - haircut);
+              const freed    = scoreWeightMap.get(secondAsset)! - secondW;
+              scoreWeightMap.set(secondAsset, secondW);
+              const others   = [...scoreWeightMap.keys()].filter(a => a !== firstAsset && a !== secondAsset);
               const otherSum = others.reduce((s, a) => s + scoreWeightMap.get(a)!, 0);
               if (otherSum > 0 && freed > 0) {
                 for (const a of others) scoreWeightMap.set(a, scoreWeightMap.get(a)! + freed * (scoreWeightMap.get(a)! / otherSum));
               }
-              logger.info(`[SCANNER] BTC/ETH corr=${corr.toFixed(3)} → haircut=${(haircut * 100).toFixed(1)}%, redistributed ${freed > 0 ? "to " + (others.join(", ") || "none") : "nothing freed"}`);
+              logger.info(`[SCANNER] ${firstAsset}/${secondAsset} corr=${corr.toFixed(3)} → haircut=${(haircut * 100).toFixed(1)}%, redistributed ${freed > 0 ? "to " + (others.join(", ") || "none") : "nothing freed"}`);
             }
           }
           if (result.changed) {

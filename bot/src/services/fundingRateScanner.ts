@@ -50,7 +50,7 @@ export interface ScanResult {
 const EWMA_ALPHA     = 0.15;
 const MAX_RING       = 20;
 const TREND_RING     = 5;    // EWMA samples kept for slope/trend detection
-const DEFAULT_ASSETS = ["BTC", "ETH", "SOL", "JTO"];
+const DEFAULT_ASSETS = (process.env.TRADING_ASSETS ?? "BTC,ETH,SOL,JTO").split(",").map(a => a.trim()); // Fallback assets from env
 const ATR_TARGET_PCT = parseFloat(process.env.ATR_TARGET_VOL_PCT ?? "0.02"); // 2% price stdDev baseline
 
 // ── FundingRateScanner ─────────────────────────────────────────────────────────

@@ -55,7 +55,7 @@ export async function getCrossChainFunding(
   hlExecutor: HyperliquidExecutor,
   logger: Logger,
   cexRates?: CexFundingRates,
-  assets: string[] = ["BTC", "ETH", "SOL", "JTO"]
+  assets: string[] = (process.env.TRADING_ASSETS ?? "BTC,ETH,SOL,JTO").split(",").map(a => a.trim())
 ): Promise<FundingByChain> {
   try {
     // 1. Primary: Hyperliquid funding rates (Solana entry)

@@ -6,7 +6,7 @@
 import { CROSS_CHAIN_CONFIG } from "../config/crossChain";
 import { Logger } from "../logger";
 
-type FundingAsset = "BTC" | "ETH";
+type FundingAsset = string; // Allow any asset, not just BTC|ETH
 
 // Mock bridge function (replace with real bridge SDK)
 async function bridgeFunds({

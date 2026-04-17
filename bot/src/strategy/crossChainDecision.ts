@@ -7,7 +7,7 @@ import { CROSS_CHAIN_CONFIG } from "../config/crossChain";
 import { estimateCosts } from "../services/costModel";
 import { Logger } from "../logger";
 
-export type FundingAsset = "BTC" | "ETH";
+export type FundingAsset = string; // Allow any asset, not just BTC|ETH
 
 export interface CrossChainDecision {
   asset: FundingAsset;
